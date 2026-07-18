@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"sync/atomic"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
 // RoundRobin hands out backends in a fixed rotation.

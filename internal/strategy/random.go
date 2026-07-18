@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"net/http"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
 // Random picks a uniformly random backend.

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
-	"github.com/arsanantha1890-prog/gobalance/internal/pool"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
 )
 
 func mustBackend(t *testing.T, name, rawURL string) *backend.Backend {

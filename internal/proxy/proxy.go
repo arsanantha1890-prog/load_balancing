@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/pool"
-	"github.com/arsanantha1890-prog/gobalance/internal/strategy"
+	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
+	"github.com/arsanantha1890-prog/load_balancing/internal/strategy"
 )
 
 // Balancer is an http.Handler that forwards requests to a pool of backends.

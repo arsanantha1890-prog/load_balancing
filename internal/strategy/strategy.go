@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
 // ErrNoBackends is returned when there is nothing healthy to route to.

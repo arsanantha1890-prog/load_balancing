@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
 func TestInflightRace(t *testing.T) {

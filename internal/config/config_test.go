@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/config"
+	"github.com/arsanantha1890-prog/load_balancing/internal/config"
 )
 
 const good = `

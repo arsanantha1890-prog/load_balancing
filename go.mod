@@ -1,4 +1,4 @@
-module github.com/arsanantha1890-prog/gobalance
+module github.com/arsanantha1890-prog/load_balancing
 
 go 1.22
 

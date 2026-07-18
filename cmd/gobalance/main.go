@@ -22,11 +22,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
-	"github.com/arsanantha1890-prog/gobalance/internal/config"
-	"github.com/arsanantha1890-prog/gobalance/internal/pool"
-	"github.com/arsanantha1890-prog/gobalance/internal/proxy"
-	"github.com/arsanantha1890-prog/gobalance/internal/strategy"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/config"
+	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
+	"github.com/arsanantha1890-prog/load_balancing/internal/proxy"
+	"github.com/arsanantha1890-prog/load_balancing/internal/strategy"
 )
 
 func main() {

@@ -10,7 +10,7 @@ package pool
 import (
 	"sync"
 
-	"github.com/arsanantha1890-prog/gobalance/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
 // Pool is a concurrency-safe set of backends.
