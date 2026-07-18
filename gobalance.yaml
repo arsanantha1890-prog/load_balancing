@@ -1,0 +1,32 @@
+# GoBalance configuration.
+#
+# Start the three mock backends first:   make backends
+# Then start the balancer:               make run
+# Then send traffic:                     make smoke
+
+listen: ":8080"        # client traffic
+admin_listen: ":8081"  # /healthz, /readyz, /backends
+
+# Try changing this to "random" and re-running `make smoke`.
+# Available in week 1: round_robin, random
+# Week 2 adds: weighted_round_robin, least_connections, p2c, ewma
+strategy: round_robin
+
+timeouts:
+  read: 15s
+  write: 15s
+  idle: 60s
+  dial: 2s
+  response_header: 10s
+  graceful_shutdown: 20s
+
+backends:
+  - name: alpha
+    url: http://127.0.0.1:9001
+    weight: 1
+  - name: beta
+    url: http://127.0.0.1:9002
+    weight: 1
+  - name: gamma
+    url: http://127.0.0.1:9003
+    weight: 1
