@@ -42,6 +42,7 @@ func main() {
 func run() error {
 	configPath := flag.String("config", "gobalance.yaml", "path to the config file")
 	logLevel := flag.String("log-level", "info", "debug | info | warn | error")
+	strategyName := flag.String("strategy", "", "override the strategy named in the config file")
 	flag.Parse()
 
 	log := newLogger(*logLevel)
@@ -61,6 +62,10 @@ func run() error {
 		}
 		backends = append(backends, b)
 		log.Info("registered backend", "name", b.Name, "url", b.URL.String(), "weight", b.Weight)
+	}
+
+	if *strategyName != "" {
+		cfg.Strategy = *strategyName
 	}
 
 	strat, err := strategy.Get(cfg.Strategy)
