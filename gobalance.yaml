@@ -1,16 +1,14 @@
 # GoBalance configuration.
 #
-# Start the three mock backends first:   make backends
-# Then start the balancer:               make run
-# Then send traffic:                     make smoke
+#   start backends:  see scripts/ or bench\chaos.ps1
+#   start balancer:  go run ./cmd/gobalance -config gobalance.yaml
+#   override:        go run ./cmd/gobalance -strategy p2c
 
 listen: ":8080"        # client traffic
 admin_listen: ":8081"  # /healthz, /readyz, /backends
 
-# Try changing this to "random" and re-running `make smoke`.
-# Available in week 1: round_robin, random
-# Week 2 adds: weighted_round_robin, least_connections, p2c, ewma
-strategy: round_robin
+# round_robin | weighted_round_robin | least_connections | p2c | ewma | lru | random
+strategy: p2c
 
 timeouts:
   read: 15s
@@ -19,6 +17,43 @@ timeouts:
   dial: 2s
   response_header: 10s
   graceful_shutdown: 20s
+
+# ACTIVE health checking: a background prober.
+# The only mechanism that can detect RECOVERY, because a dead backend receives
+# no traffic for a passive check to observe.
+health:
+  enabled: true
+  path: /healthz
+  interval: 2s
+  timeout: 1s
+  healthy_threshold: 2     # consecutive successes before readmitting
+  unhealthy_threshold: 3   # consecutive failures before ejecting
+  # The two thresholds differ on purpose. One shared value makes a marginal
+  # backend flap in and out of the pool on every poll.
+
+# PASSIVE health checking: ejection based on real traffic, between probes.
+passive_health:
+  enabled: true
+  consecutive_failures: 5
+
+# CIRCUIT BREAKER: stop paying a connect timeout for a backend already known
+# to be dead. Fail instantly instead of failing slowly.
+breaker:
+  enabled: true
+  failure_threshold: 5   # consecutive failures to open
+  success_threshold: 2   # consecutive probe successes to close
+  open_timeout: 5s       # how long to stay open before probing
+  max_probes: 1          # concurrent probes allowed while half-open
+
+# RETRIES, capped by a budget.
+# Without the budget, one dead backend doubles the load on the survivors and
+# two dead backends triple it -- a retry storm that turns a partial fault into
+# a full outage.
+retry:
+  enabled: true
+  max_retries: 2
+  budget_max_tokens: 100
+  budget_ratio: 0.2      # retries may be sustained at ~20% of successful volume
 
 backends:
   - name: alpha
