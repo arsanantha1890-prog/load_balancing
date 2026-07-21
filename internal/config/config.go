@@ -1,11 +1,11 @@
 // Package config loads and validates gobalance.yaml.
 //
-// Two rules this package follows, both worth defending in an interview:
+// Two rules this package follows:
 //
 //  1. Validate everything at startup. A load balancer that starts with a broken
 //     config and fails on the first request is worse than one that refuses to
 //     start.
-//  2. Defaults live in one place (applyDefaults), not scattered across the
+//  2. Defaults live in one place (applyDefaults), not scattered around the
 //     codebase as `if x == 0` checks.
 package config
 
@@ -17,12 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Duration wraps time.Duration so the YAML file can say "5s" instead of
-// 5000000000.
-//
-// GO NOTE: yaml.v3 cannot decode "5s" into a time.Duration on its own. Defining
-// a named type with an UnmarshalYAML method teaches it how. This is the same
-// pattern as implementing json.Unmarshaler.
+// Duration wraps time.Duration so the YAML file can say "5s".
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
@@ -38,7 +33,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// Std converts back to a plain time.Duration for use with the standard library.
+// Std converts back to a plain time.Duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
 // Config is the whole file.
@@ -47,20 +42,54 @@ type Config struct {
 	AdminListen string          `yaml:"admin_listen"`
 	Strategy    string          `yaml:"strategy"`
 	Timeouts    Timeouts        `yaml:"timeouts"`
+	Health      Health          `yaml:"health"`
+	Passive     Passive         `yaml:"passive_health"`
+	Breaker     Breaker         `yaml:"breaker"`
+	Retry       Retry           `yaml:"retry"`
 	Backends    []BackendConfig `yaml:"backends"`
 }
 
 // Timeouts groups every deadline in the system.
-//
-// A load balancer with no timeouts is a denial-of-service amplifier: one slow
-// upstream ties up connections until the process runs out of file descriptors.
 type Timeouts struct {
-	Read             Duration `yaml:"read"`              // client -> LB: time to read the request
-	Write            Duration `yaml:"write"`             // LB -> client: time to write the response
-	Idle             Duration `yaml:"idle"`              // keep-alive idle timeout
-	Dial             Duration `yaml:"dial"`              // LB -> backend: TCP connect
-	ResponseHeader   Duration `yaml:"response_header"`   // LB -> backend: time to first byte
-	GracefulShutdown Duration `yaml:"graceful_shutdown"` // drain window on SIGTERM
+	Read             Duration `yaml:"read"`
+	Write            Duration `yaml:"write"`
+	Idle             Duration `yaml:"idle"`
+	Dial             Duration `yaml:"dial"`
+	ResponseHeader   Duration `yaml:"response_header"`
+	GracefulShutdown Duration `yaml:"graceful_shutdown"`
+}
+
+// Health configures ACTIVE health checking: a background prober.
+type Health struct {
+	Enabled            bool     `yaml:"enabled"`
+	Path               string   `yaml:"path"`
+	Interval           Duration `yaml:"interval"`
+	Timeout            Duration `yaml:"timeout"`
+	HealthyThreshold   int      `yaml:"healthy_threshold"`
+	UnhealthyThreshold int      `yaml:"unhealthy_threshold"`
+}
+
+// Passive configures PASSIVE health checking: ejection based on real traffic.
+type Passive struct {
+	Enabled             bool `yaml:"enabled"`
+	ConsecutiveFailures int  `yaml:"consecutive_failures"`
+}
+
+// Breaker configures the per-backend circuit breaker.
+type Breaker struct {
+	Enabled          bool     `yaml:"enabled"`
+	FailureThreshold int      `yaml:"failure_threshold"`
+	SuccessThreshold int      `yaml:"success_threshold"`
+	OpenTimeout      Duration `yaml:"open_timeout"`
+	MaxProbes        int      `yaml:"max_probes"`
+}
+
+// Retry configures request retries and their budget.
+type Retry struct {
+	Enabled     bool    `yaml:"enabled"`
+	MaxRetries  int     `yaml:"max_retries"`
+	BudgetMax   int     `yaml:"budget_max_tokens"`
+	BudgetRatio float64 `yaml:"budget_ratio"`
 }
 
 // BackendConfig is one entry in the backends list.
@@ -79,13 +108,12 @@ func Load(path string) (*Config, error) {
 	return Parse(raw)
 }
 
-// Parse does everything Load does except touching the filesystem, which makes
-// it trivial to unit test.
+// Parse does everything Load does without touching the filesystem.
 func Parse(raw []byte) (*Config, error) {
 	var cfg Config
 
 	dec := yaml.NewDecoder(newReader(raw))
-	dec.KnownFields(true) // typo in a key name becomes an error, not silence
+	dec.KnownFields(true) // a typo in a key becomes an error, not silence
 
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
@@ -108,6 +136,7 @@ func (c *Config) applyDefaults() {
 	if c.Strategy == "" {
 		c.Strategy = "round_robin"
 	}
+
 	if c.Timeouts.Read == 0 {
 		c.Timeouts.Read = Duration(15 * time.Second)
 	}
@@ -125,6 +154,49 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Timeouts.GracefulShutdown == 0 {
 		c.Timeouts.GracefulShutdown = Duration(20 * time.Second)
+	}
+
+	if c.Health.Path == "" {
+		c.Health.Path = "/healthz"
+	}
+	if c.Health.Interval == 0 {
+		c.Health.Interval = Duration(2 * time.Second)
+	}
+	if c.Health.Timeout == 0 {
+		c.Health.Timeout = Duration(1 * time.Second)
+	}
+	if c.Health.HealthyThreshold <= 0 {
+		c.Health.HealthyThreshold = 2
+	}
+	if c.Health.UnhealthyThreshold <= 0 {
+		c.Health.UnhealthyThreshold = 3
+	}
+
+	if c.Passive.ConsecutiveFailures <= 0 {
+		c.Passive.ConsecutiveFailures = 5
+	}
+
+	if c.Breaker.FailureThreshold <= 0 {
+		c.Breaker.FailureThreshold = 5
+	}
+	if c.Breaker.SuccessThreshold <= 0 {
+		c.Breaker.SuccessThreshold = 2
+	}
+	if c.Breaker.OpenTimeout == 0 {
+		c.Breaker.OpenTimeout = Duration(5 * time.Second)
+	}
+	if c.Breaker.MaxProbes <= 0 {
+		c.Breaker.MaxProbes = 1
+	}
+
+	if c.Retry.MaxRetries <= 0 {
+		c.Retry.MaxRetries = 2
+	}
+	if c.Retry.BudgetMax <= 0 {
+		c.Retry.BudgetMax = 100
+	}
+	if c.Retry.BudgetRatio <= 0 {
+		c.Retry.BudgetRatio = 0.2
 	}
 
 	for i := range c.Backends {
@@ -157,5 +229,18 @@ func (c *Config) Validate() error {
 	if c.Listen == c.AdminListen {
 		return fmt.Errorf("listen and admin_listen must be different addresses (both are %q)", c.Listen)
 	}
+
+	// A health check that takes longer than the gap between checks means every
+	// probe overlaps the next one -- the checker falls behind and its verdicts
+	// describe the past rather than the present.
+	if c.Health.Enabled && c.Health.Timeout >= c.Health.Interval {
+		return fmt.Errorf("health.timeout (%v) must be shorter than health.interval (%v), or probes will overlap",
+			c.Health.Timeout.Std(), c.Health.Interval.Std())
+	}
+
+	if c.Retry.BudgetRatio > 1 {
+		return fmt.Errorf("retry.budget_ratio is %v; a value above 1 means retries may exceed successful traffic", c.Retry.BudgetRatio)
+	}
+
 	return nil
 }

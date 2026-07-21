@@ -1,21 +1,16 @@
 // Command mockbackend is a tiny upstream server used to test and benchmark
 // GoBalance.
 //
-// It exists so you can control the one variable that decides which load
-// balancing strategy wins: how long a backend takes to respond.
-//
-//	-name    identity returned in the body and the X-Backend header
-//	-addr    listen address, e.g. :9001
-//	-delay   base processing delay, e.g. 10ms
-//	-jitter  random extra delay in [0, jitter)
-//	-tail    probability (0..1) that a request is a "slow tail" request
+//	-name        identity returned in the body and the X-Backend header
+//	-addr        listen address, e.g. :9001
+//	-delay       base processing delay, e.g. 10ms
+//	-jitter      random extra delay in [0, jitter)
+//	-tail        probability (0..1) that a request is a "slow tail" request
 //	-tail-delay  how slow those tail requests are
+//	-fail-rate   probability (0..1) that a request returns 500  [week 3]
 //
 // Per-request overrides: /?delay=250ms and /?status=500
-//
-// Why this matters: with three identical instant backends, every strategy looks
-// the same. The interesting result in week 6 comes from heterogeneous backends
-// with heavy-tailed service times, and this flag set is how you create them.
+// Control endpoints:     /healthz  /toggle  /sick  /well
 package main
 
 import (
@@ -39,17 +34,23 @@ func main() {
 		jitter    = flag.Duration("jitter", 0, "uniform random extra delay in [0, jitter)")
 		tailProb  = flag.Float64("tail", 0, "probability a request is a slow-tail request (0..1)")
 		tailDelay = flag.Duration("tail-delay", 500*time.Millisecond, "delay for slow-tail requests")
+		failRate  = flag.Float64("fail-rate", 0, "probability a request returns 500 (0..1)")
 	)
 	flag.Parse()
 
 	var served atomic.Uint64
+
 	healthy := &atomic.Bool{}
 	healthy.Store(true)
 
+	// sick means "serve 500s but keep answering health checks normally".
+	// That models a GREY FAILURE: a backend that looks fine to a shallow health
+	// probe while failing real work. It is the case passive health checking
+	// exists for, and it is far more common in production than a clean crash.
+	sick := &atomic.Bool{}
+
 	mux := http.NewServeMux()
 
-	// /healthz is what the week-3 active health checker will poll.
-	// /toggle flips it so you can simulate a failure without killing the process.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if !healthy.Load() {
 			http.Error(w, "unhealthy", http.StatusServiceUnavailable)
@@ -58,14 +59,25 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
+	// Flip health so the ACTIVE checker notices.
 	mux.HandleFunc("/toggle", func(w http.ResponseWriter, r *http.Request) {
-		newState := !healthy.Load()
-		healthy.Store(newState)
-		fmt.Fprintf(w, "%s healthy=%v\n", *name, newState)
+		state := !healthy.Load()
+		healthy.Store(state)
+		fmt.Fprintf(w, "%s healthy=%v\n", *name, state)
+	})
+
+	// Start failing real traffic while still reporting healthy: grey failure.
+	mux.HandleFunc("/sick", func(w http.ResponseWriter, r *http.Request) {
+		sick.Store(true)
+		fmt.Fprintf(w, "%s is now failing requests but still reports healthy\n", *name)
+	})
+
+	mux.HandleFunc("/well", func(w http.ResponseWriter, r *http.Request) {
+		sick.Store(false)
+		fmt.Fprintf(w, "%s recovered\n", *name)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Per-request delay override wins over the flags.
 		d := *delay
 		if q := r.URL.Query().Get("delay"); q != "" {
 			if parsed, err := time.ParseDuration(q); err == nil {
@@ -83,6 +95,9 @@ func main() {
 		time.Sleep(d)
 
 		status := http.StatusOK
+		if sick.Load() || (*failRate > 0 && rand.Float64() < *failRate) {
+			status = http.StatusInternalServerError
+		}
 		if q := r.URL.Query().Get("status"); q != "" {
 			if parsed, err := strconv.Atoi(q); err == nil && parsed >= 100 && parsed < 600 {
 				status = parsed
@@ -99,11 +114,12 @@ func main() {
 			"path":     r.URL.Path,
 			"delay_ms": d.Milliseconds(),
 			"served":   n,
+			"status":   status,
 		})
 	})
 
-	log.Printf("mockbackend %q listening on %s (delay=%v jitter=%v tail=%.2f@%v)",
-		*name, *addr, *delay, *jitter, *tailProb, *tailDelay)
+	log.Printf("mockbackend %q listening on %s (delay=%v jitter=%v tail=%.2f@%v fail-rate=%.2f)",
+		*name, *addr, *delay, *jitter, *tailProb, *tailDelay, *failRate)
 
 	srv := &http.Server{
 		Addr:              *addr,
