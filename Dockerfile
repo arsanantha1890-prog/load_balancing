@@ -1,7 +1,7 @@
 # Multi-stage build: compile with the Go toolchain, ship a tiny final image.
 # The resulting image is a few megabytes and contains no shell, no package
 # manager and nothing else to attack.
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download

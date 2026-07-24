@@ -1,0 +1,56 @@
+# Mock backend Deployment + Service for testing in the kind cluster.
+# Scale this up/down to watch the balancer discover new pods.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-backend
+  namespace: gobalance
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mock-backend
+  template:
+    metadata:
+      labels:
+        app: mock-backend
+    spec:
+      containers:
+        - name: mockbackend
+          image: gobalance-mock:local
+          args:
+            - -name
+            - $(POD_NAME)
+            - -addr
+            - ":8080"
+            - -delay
+            - "10ms"
+            - -jitter
+            - "5ms"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-backend
+  namespace: gobalance
+spec:
+  selector:
+    app: mock-backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

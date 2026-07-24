@@ -1,4 +1,3 @@
-// Command gobalance is an HTTP load balancer.
 package main
 
 import (
@@ -15,10 +14,14 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 	"github.com/arsanantha1890-prog/load_balancing/internal/breaker"
 	"github.com/arsanantha1890-prog/load_balancing/internal/config"
+	"github.com/arsanantha1890-prog/load_balancing/internal/discovery"
 	"github.com/arsanantha1890-prog/load_balancing/internal/health"
 	"github.com/arsanantha1890-prog/load_balancing/internal/metrics"
 	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
@@ -52,24 +55,64 @@ func run() error {
 		cfg.Strategy = *strategyName
 	}
 
-	// --- backends ---
-	backends := make([]*backend.Backend, 0, len(cfg.Backends))
-	for _, bc := range cfg.Backends {
-		b, err := backend.New(bc.Name, bc.URL, bc.Weight,
-			cfg.Timeouts.Dial.Std(), cfg.Timeouts.ResponseHeader.Std())
+	// --- pool (empty if kubernetes mode; populated by provider) ---
+	p := pool.New(nil)
+
+	// --- discovery provider ---
+	var provider discovery.Provider
+
+	switch cfg.Discovery.Mode {
+	case "kubernetes":
+		client, err := buildKubeClient(cfg.Discovery.Kubeconfig)
 		if err != nil {
-			return err
+			return fmt.Errorf("building kubernetes client: %w", err)
 		}
+
+		var brkCfg *breaker.Config
 		if cfg.Breaker.Enabled {
-			b.Breaker = breaker.New(breaker.Config{
+			brkCfg = &breaker.Config{
 				FailureThreshold: cfg.Breaker.FailureThreshold,
 				SuccessThreshold: cfg.Breaker.SuccessThreshold,
 				OpenTimeout:      cfg.Breaker.OpenTimeout.Std(),
 				MaxProbes:        cfg.Breaker.MaxProbes,
-			})
+			}
 		}
-		backends = append(backends, b)
-		log.Info("registered backend", "name", b.Name, "url", b.URL.String(), "weight", b.Weight)
+
+		provider = discovery.NewKubernetesProvider(client, p, discovery.KubernetesConfig{
+			ServiceName:     cfg.Discovery.ServiceName,
+			Namespace:       cfg.Discovery.Namespace,
+			PortName:        cfg.Discovery.PortName,
+			BreakerCfg:      brkCfg,
+			DialTimeout:     cfg.Timeouts.Dial.Std(),
+			ResponseTimeout: cfg.Timeouts.ResponseHeader.Std(),
+		}, log)
+
+		log.Info("discovery mode: kubernetes",
+			"service", cfg.Discovery.ServiceName,
+			"namespace", cfg.Discovery.Namespace)
+
+	default: // "static"
+		backends := make([]*backend.Backend, 0, len(cfg.Backends))
+		for _, bc := range cfg.Backends {
+			b, err := backend.New(bc.Name, bc.URL, bc.Weight,
+				cfg.Timeouts.Dial.Std(), cfg.Timeouts.ResponseHeader.Std())
+			if err != nil {
+				return err
+			}
+			if cfg.Breaker.Enabled {
+				b.Breaker = breaker.New(breaker.Config{
+					FailureThreshold: cfg.Breaker.FailureThreshold,
+					SuccessThreshold: cfg.Breaker.SuccessThreshold,
+					OpenTimeout:      cfg.Breaker.OpenTimeout.Std(),
+					MaxProbes:        cfg.Breaker.MaxProbes,
+				})
+			}
+			backends = append(backends, b)
+			log.Info("registered backend", "name", b.Name, "url", b.URL.String(), "weight", b.Weight)
+		}
+		p.Set(backends)
+		provider = discovery.StaticProvider{}
+		log.Info("discovery mode: static", "backends", len(backends))
 	}
 
 	strat, err := strategy.Get(cfg.Strategy)
@@ -77,10 +120,7 @@ func run() error {
 		return err
 	}
 
-	p := pool.New(backends)
 	budget := retry.NewBudget(cfg.Retry.BudgetMax, cfg.Retry.BudgetRatio)
-
-	// --- metrics ---
 	m := metrics.New()
 
 	balancer := proxy.New(p, strat, log,
@@ -99,6 +139,13 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Discovery provider.
+	go func() {
+		if err := provider.Run(ctx); err != nil {
+			log.Error("discovery provider failed", "error", err)
+		}
+	}()
+
 	// Health checker.
 	checker := health.New(p, health.Config{
 		Enabled:            cfg.Health.Enabled,
@@ -110,23 +157,25 @@ func run() error {
 	}, log)
 	go checker.Run(ctx)
 
-	// Metrics collector: syncs health/breaker gauges once per second.
+	// Metrics collector.
 	go m.RunCollector(ctx, p, budget, time.Second)
 
-	// Config watcher: hot reload.
-	go func() {
-		if err := reload.Watch(ctx, reload.Config{
-			Path:            *configPath,
-			Pool:            p,
-			BreakerCfg:      cfg.Breaker,
-			DialTimeout:     cfg.Timeouts.Dial.Std(),
-			ResponseTimeout: cfg.Timeouts.ResponseHeader.Std(),
-			OnReload:        balancer.SwapStrategy,
-			Log:             log,
-		}); err != nil {
-			log.Error("config watcher failed", "error", err)
-		}
-	}()
+	// Config watcher (only in static mode — in k8s mode the informer is the source of truth).
+	if cfg.Discovery.Mode == "static" {
+		go func() {
+			if err := reload.Watch(ctx, reload.Config{
+				Path:            *configPath,
+				Pool:            p,
+				BreakerCfg:      cfg.Breaker,
+				DialTimeout:     cfg.Timeouts.Dial.Std(),
+				ResponseTimeout: cfg.Timeouts.ResponseHeader.Std(),
+				OnReload:        balancer.SwapStrategy,
+				Log:             log,
+			}); err != nil {
+				log.Error("config watcher failed", "error", err)
+			}
+		}()
+	}
 
 	// --- servers ---
 	proxySrv := &http.Server{
@@ -148,7 +197,7 @@ func run() error {
 
 	go func() {
 		log.Info("proxy listening", "addr", cfg.Listen, "strategy", strat.Name(),
-			"backends", len(backends), "retry", cfg.Retry.Enabled, "breaker", cfg.Breaker.Enabled)
+			"retry", cfg.Retry.Enabled, "breaker", cfg.Breaker.Enabled)
 		if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
@@ -171,7 +220,7 @@ func run() error {
 		log.Info("shutdown signal received", "grace", cfg.Timeouts.GracefulShutdown.Std())
 	}
 
-	cancel() // stop health checker, metrics collector, config watcher
+	cancel()
 
 	shutdownCtx, shutCancel := context.WithTimeout(context.Background(), cfg.Timeouts.GracefulShutdown.Std())
 	defer shutCancel()
@@ -183,6 +232,30 @@ func run() error {
 
 	log.Info("shutdown complete")
 	return nil
+}
+
+// buildKubeClient creates a Kubernetes clientset from either a kubeconfig file
+// or in-cluster service account credentials.
+//
+// The order mirrors kubectl: explicit path wins, then KUBECONFIG env var, then
+// in-cluster. This is the standard pattern used by every Kubernetes controller.
+func buildKubeClient(kubeconfigPath string) (kubernetes.Interface, error) {
+	var cfg *rest.Config
+	var err error
+
+	if kubeconfigPath != "" {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	} else if kc := os.Getenv("KUBECONFIG"); kc != "" {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kc)
+	} else {
+		cfg, err = rest.InClusterConfig()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return kubernetes.NewForConfig(cfg)
 }
 
 func adminHandler(b *proxy.Balancer, m *metrics.Metrics) http.Handler {
@@ -247,7 +320,6 @@ func adminHandler(b *proxy.Balancer, m *metrics.Metrics) http.Handler {
 		_ = enc.Encode(out)
 	})
 
-	// Prometheus metrics endpoint.
 	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
 
 	return mux

@@ -1,12 +1,3 @@
-// Package config loads and validates gobalance.yaml.
-//
-// Two rules this package follows:
-//
-//  1. Validate everything at startup. A load balancer that starts with a broken
-//     config and fails on the first request is worse than one that refuses to
-//     start.
-//  2. Defaults live in one place (applyDefaults), not scattered around the
-//     codebase as `if x == 0` checks.
 package config
 
 import (
@@ -17,7 +8,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Duration wraps time.Duration so the YAML file can say "5s".
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
@@ -33,10 +23,8 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// Std converts back to a plain time.Duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
-// Config is the whole file.
 type Config struct {
 	Listen      string          `yaml:"listen"`
 	AdminListen string          `yaml:"admin_listen"`
@@ -46,10 +34,10 @@ type Config struct {
 	Passive     Passive         `yaml:"passive_health"`
 	Breaker     Breaker         `yaml:"breaker"`
 	Retry       Retry           `yaml:"retry"`
+	Discovery   Discovery       `yaml:"discovery"`
 	Backends    []BackendConfig `yaml:"backends"`
 }
 
-// Timeouts groups every deadline in the system.
 type Timeouts struct {
 	Read             Duration `yaml:"read"`
 	Write            Duration `yaml:"write"`
@@ -59,7 +47,6 @@ type Timeouts struct {
 	GracefulShutdown Duration `yaml:"graceful_shutdown"`
 }
 
-// Health configures ACTIVE health checking: a background prober.
 type Health struct {
 	Enabled            bool     `yaml:"enabled"`
 	Path               string   `yaml:"path"`
@@ -69,13 +56,11 @@ type Health struct {
 	UnhealthyThreshold int      `yaml:"unhealthy_threshold"`
 }
 
-// Passive configures PASSIVE health checking: ejection based on real traffic.
 type Passive struct {
 	Enabled             bool `yaml:"enabled"`
 	ConsecutiveFailures int  `yaml:"consecutive_failures"`
 }
 
-// Breaker configures the per-backend circuit breaker.
 type Breaker struct {
 	Enabled          bool     `yaml:"enabled"`
 	FailureThreshold int      `yaml:"failure_threshold"`
@@ -84,7 +69,6 @@ type Breaker struct {
 	MaxProbes        int      `yaml:"max_probes"`
 }
 
-// Retry configures request retries and their budget.
 type Retry struct {
 	Enabled     bool    `yaml:"enabled"`
 	MaxRetries  int     `yaml:"max_retries"`
@@ -92,14 +76,27 @@ type Retry struct {
 	BudgetRatio float64 `yaml:"budget_ratio"`
 }
 
-// BackendConfig is one entry in the backends list.
+// Discovery configures WHERE the backend list comes from.
+//
+//   - mode: "static" (default) — backends from the backends[] list in this file.
+//   - mode: "kubernetes" — backends from EndpointSlice objects for a Service.
+//
+// In kubernetes mode, the backends[] list is ignored; the pool is entirely
+// driven by the informer. In static mode, the discovery section is ignored.
+type Discovery struct {
+	Mode        string `yaml:"mode"`         // "static" or "kubernetes"
+	ServiceName string `yaml:"service_name"` // k8s Service name to watch
+	Namespace   string `yaml:"namespace"`    // k8s namespace
+	PortName    string `yaml:"port_name"`    // named port to select (optional)
+	Kubeconfig  string `yaml:"kubeconfig"`   // path to kubeconfig (optional, uses in-cluster if empty)
+}
+
 type BackendConfig struct {
 	Name   string `yaml:"name"`
 	URL    string `yaml:"url"`
 	Weight int    `yaml:"weight"`
 }
 
-// Load reads, parses, defaults and validates a config file.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -108,12 +105,11 @@ func Load(path string) (*Config, error) {
 	return Parse(raw)
 }
 
-// Parse does everything Load does without touching the filesystem.
 func Parse(raw []byte) (*Config, error) {
 	var cfg Config
 
 	dec := yaml.NewDecoder(newReader(raw))
-	dec.KnownFields(true) // a typo in a key becomes an error, not silence
+	dec.KnownFields(true)
 
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
@@ -199,6 +195,13 @@ func (c *Config) applyDefaults() {
 		c.Retry.BudgetRatio = 0.2
 	}
 
+	if c.Discovery.Mode == "" {
+		c.Discovery.Mode = "static"
+	}
+	if c.Discovery.Namespace == "" {
+		c.Discovery.Namespace = "default"
+	}
+
 	for i := range c.Backends {
 		if c.Backends[i].Weight <= 0 {
 			c.Backends[i].Weight = 1
@@ -209,10 +212,17 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Validate returns the first thing wrong with the config.
 func (c *Config) Validate() error {
-	if len(c.Backends) == 0 {
-		return fmt.Errorf("config must list at least one backend")
+	if c.Discovery.Mode == "static" && len(c.Backends) == 0 {
+		return fmt.Errorf("in static discovery mode, at least one backend must be listed")
+	}
+
+	if c.Discovery.Mode == "kubernetes" && c.Discovery.ServiceName == "" {
+		return fmt.Errorf("in kubernetes discovery mode, discovery.service_name must be set")
+	}
+
+	if c.Discovery.Mode != "static" && c.Discovery.Mode != "kubernetes" {
+		return fmt.Errorf("discovery.mode must be \"static\" or \"kubernetes\", got %q", c.Discovery.Mode)
 	}
 
 	seen := map[string]bool{}
@@ -221,7 +231,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("backend %q has no url", b.Name)
 		}
 		if seen[b.Name] {
-			return fmt.Errorf("duplicate backend name %q: names are used as metric labels and must be unique", b.Name)
+			return fmt.Errorf("duplicate backend name %q", b.Name)
 		}
 		seen[b.Name] = true
 	}
@@ -230,9 +240,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen and admin_listen must be different addresses (both are %q)", c.Listen)
 	}
 
-	// A health check that takes longer than the gap between checks means every
-	// probe overlaps the next one -- the checker falls behind and its verdicts
-	// describe the past rather than the present.
 	if c.Health.Enabled && c.Health.Timeout >= c.Health.Interval {
 		return fmt.Errorf("health.timeout (%v) must be shorter than health.interval (%v), or probes will overlap",
 			c.Health.Timeout.Std(), c.Health.Interval.Std())

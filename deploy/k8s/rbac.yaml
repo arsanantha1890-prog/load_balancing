@@ -1,0 +1,31 @@
+# GoBalance needs permission to READ EndpointSlices in its namespace.
+# This is the minimum required — no write access, no cluster-wide scope.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gobalance
+  namespace: gobalance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gobalance-endpointslice-reader
+  namespace: gobalance
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gobalance-endpointslice-reader
+  namespace: gobalance
+subjects:
+  - kind: ServiceAccount
+    name: gobalance
+    namespace: gobalance
+roleRef:
+  kind: Role
+  name: gobalance-endpointslice-reader
+  apiGroup: rbac.authorization.k8s.io
