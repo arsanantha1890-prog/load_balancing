@@ -1,0 +1,106 @@
+# GoBalance configuration for Kubernetes discovery mode.
+# Mounted as a ConfigMap so it can be changed without rebuilding the image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gobalance-config
+  namespace: gobalance
+data:
+  gobalance.yaml: |
+    listen: ":8080"
+    admin_listen: ":8081"
+    strategy: p2c
+
+    discovery:
+      mode: kubernetes
+      service_name: mock-backend
+      namespace: gobalance
+
+    health:
+      enabled: true
+      path: /healthz
+      interval: 2s
+      timeout: 1s
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+    passive_health:
+      enabled: true
+      consecutive_failures: 5
+
+    breaker:
+      enabled: true
+      failure_threshold: 5
+      success_threshold: 2
+      open_timeout: 5s
+      max_probes: 1
+
+    retry:
+      enabled: true
+      max_retries: 2
+      budget_max_tokens: 100
+      budget_ratio: 0.2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobalance
+  namespace: gobalance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gobalance
+  template:
+    metadata:
+      labels:
+        app: gobalance
+    spec:
+      serviceAccountName: gobalance
+      containers:
+        - name: gobalance
+          image: gobalance:local
+          args:
+            - -config
+            - /etc/gobalance/gobalance.yaml
+          ports:
+            - containerPort: 8080
+              name: proxy
+            - containerPort: 8081
+              name: admin
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gobalance
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gobalance-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gobalance
+  namespace: gobalance
+spec:
+  selector:
+    app: gobalance
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: proxy
+    - name: admin
+      port: 8081
+      targetPort: admin
