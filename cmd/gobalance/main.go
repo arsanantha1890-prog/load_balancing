@@ -1,9 +1,4 @@
 // Command gobalance is an HTTP load balancer.
-//
-// It runs two servers and one background worker:
-//   - the proxy server (default :8080), which forwards client traffic
-//   - the admin server (default :8081), which exposes /healthz and /backends
-//   - the health checker, which probes backends on an interval
 package main
 
 import (
@@ -19,12 +14,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 	"github.com/arsanantha1890-prog/load_balancing/internal/breaker"
 	"github.com/arsanantha1890-prog/load_balancing/internal/config"
 	"github.com/arsanantha1890-prog/load_balancing/internal/health"
+	"github.com/arsanantha1890-prog/load_balancing/internal/metrics"
 	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
 	"github.com/arsanantha1890-prog/load_balancing/internal/proxy"
+	"github.com/arsanantha1890-prog/load_balancing/internal/reload"
 	"github.com/arsanantha1890-prog/load_balancing/internal/retry"
 	"github.com/arsanantha1890-prog/load_balancing/internal/strategy"
 )
@@ -49,13 +48,11 @@ func run() error {
 		return err
 	}
 
-	// A command-line override beats the config file, which is what makes
-	// benchmarking scriptable: same config, same backends, one variable changed.
 	if *strategyName != "" {
 		cfg.Strategy = *strategyName
 	}
 
-	// Build one Backend per config entry, attaching a circuit breaker.
+	// --- backends ---
 	backends := make([]*backend.Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
 		b, err := backend.New(bc.Name, bc.URL, bc.Weight,
@@ -63,9 +60,6 @@ func run() error {
 		if err != nil {
 			return err
 		}
-
-		// Breakers are attached before any goroutine starts, so the field is
-		// effectively immutable from the request path's point of view.
 		if cfg.Breaker.Enabled {
 			b.Breaker = breaker.New(breaker.Config{
 				FailureThreshold: cfg.Breaker.FailureThreshold,
@@ -74,7 +68,6 @@ func run() error {
 				MaxProbes:        cfg.Breaker.MaxProbes,
 			})
 		}
-
 		backends = append(backends, b)
 		log.Info("registered backend", "name", b.Name, "url", b.URL.String(), "weight", b.Weight)
 	}
@@ -85,11 +78,10 @@ func run() error {
 	}
 
 	p := pool.New(backends)
-
-	// One budget shared by every backend. It has to be global: the whole point
-	// is to cap total retry traffic, and a per-backend budget would let three
-	// failing backends each spend their own allowance.
 	budget := retry.NewBudget(cfg.Retry.BudgetMax, cfg.Retry.BudgetRatio)
+
+	// --- metrics ---
+	m := metrics.New()
 
 	balancer := proxy.New(p, strat, log,
 		proxy.WithRetry(proxy.RetryConfig{
@@ -100,13 +92,14 @@ func run() error {
 			Enabled:             cfg.Passive.Enabled,
 			ConsecutiveFailures: uint32(cfg.Passive.ConsecutiveFailures),
 		}),
+		proxy.WithMetrics(m),
 	)
 
-	// The health checker runs until this context is cancelled, which happens on
-	// shutdown. Separate from the signal context so ordering is explicit.
-	checkerCtx, stopChecker := context.WithCancel(context.Background())
-	defer stopChecker()
+	// --- background workers ---
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
+	// Health checker.
 	checker := health.New(p, health.Config{
 		Enabled:            cfg.Health.Enabled,
 		Path:               cfg.Health.Path,
@@ -115,8 +108,27 @@ func run() error {
 		HealthyThreshold:   cfg.Health.HealthyThreshold,
 		UnhealthyThreshold: cfg.Health.UnhealthyThreshold,
 	}, log)
-	go checker.Run(checkerCtx)
+	go checker.Run(ctx)
 
+	// Metrics collector: syncs health/breaker gauges once per second.
+	go m.RunCollector(ctx, p, budget, time.Second)
+
+	// Config watcher: hot reload.
+	go func() {
+		if err := reload.Watch(ctx, reload.Config{
+			Path:            *configPath,
+			Pool:            p,
+			BreakerCfg:      cfg.Breaker,
+			DialTimeout:     cfg.Timeouts.Dial.Std(),
+			ResponseTimeout: cfg.Timeouts.ResponseHeader.Std(),
+			OnReload:        balancer.SwapStrategy,
+			Log:             log,
+		}); err != nil {
+			log.Error("config watcher failed", "error", err)
+		}
+	}()
+
+	// --- servers ---
 	proxySrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           balancer,
@@ -128,7 +140,7 @@ func run() error {
 
 	adminSrv := &http.Server{
 		Addr:              cfg.AdminListen,
-		Handler:           adminHandler(balancer),
+		Handler:           adminHandler(balancer, m),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -143,29 +155,26 @@ func run() error {
 	}()
 
 	go func() {
-		log.Info("admin listening", "addr", cfg.AdminListen)
+		log.Info("admin listening", "addr", cfg.AdminListen, "metrics", "/metrics")
 		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("admin server: %w", err)
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	select {
 	case err := <-errCh:
 		return err
-	case <-ctx.Done():
-		log.Info("shutdown signal received, draining in-flight requests",
-			"grace", cfg.Timeouts.GracefulShutdown.Std())
+	case <-sigCtx.Done():
+		log.Info("shutdown signal received", "grace", cfg.Timeouts.GracefulShutdown.Std())
 	}
 
-	// Stop probing first. Health checks during a drain are noise at best, and
-	// at worst they mark a backend down while it is still finishing requests.
-	stopChecker()
+	cancel() // stop health checker, metrics collector, config watcher
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.GracefulShutdown.Std())
-	defer cancel()
+	shutdownCtx, shutCancel := context.WithTimeout(context.Background(), cfg.Timeouts.GracefulShutdown.Std())
+	defer shutCancel()
 
 	_ = adminSrv.Shutdown(shutdownCtx)
 	if err := proxySrv.Shutdown(shutdownCtx); err != nil {
@@ -176,8 +185,7 @@ func run() error {
 	return nil
 }
 
-// adminHandler serves the operational endpoints.
-func adminHandler(b *proxy.Balancer) http.Handler {
+func adminHandler(b *proxy.Balancer, m *metrics.Metrics) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -238,6 +246,9 @@ func adminHandler(b *proxy.Balancer) http.Handler {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(out)
 	})
+
+	// Prometheus metrics endpoint.
+	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
 
 	return mux
 }

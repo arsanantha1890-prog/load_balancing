@@ -1,24 +1,20 @@
-// Package proxy is the request path: the code that runs on every request.
+// Package proxy is the request path.
 //
-// WEEK 3 turned this from a straight line into a small retry loop:
-//
-//	for each attempt:
-//	    choose a backend  (healthy, breaker permits, not already tried)
-//	    acquire a breaker slot
-//	    forward
-//	    on transport failure and nothing written yet -> try another backend
-//	    on success or on any response already sent    -> stop
-//
-// Everything about correctness here comes from one question: HAS ANYTHING BEEN
-// WRITTEN TO THE CLIENT YET? Once a byte is on the wire, retrying is impossible.
+// WEEK 4 CHANGES:
+//   - Prometheus metrics on every request (counters, histograms, failure labels)
+//   - Atomic strategy swap for hot reload
+//   - Retry attempt counter for the retries_total metric
 package proxy
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
+	"github.com/arsanantha1890-prog/load_balancing/internal/metrics"
 	"github.com/arsanantha1890-prog/load_balancing/internal/pool"
 	"github.com/arsanantha1890-prog/load_balancing/internal/retry"
 	"github.com/arsanantha1890-prog/load_balancing/internal/retryctx"
@@ -31,8 +27,7 @@ type RetryConfig struct {
 	MaxRetries int
 }
 
-// PassiveConfig controls passive health checking: ejecting a backend based on
-// the failures of real traffic, without waiting for the next active probe.
+// PassiveConfig controls passive health checking.
 type PassiveConfig struct {
 	Enabled             bool
 	ConsecutiveFailures uint32
@@ -40,26 +35,23 @@ type PassiveConfig struct {
 
 // Balancer is an http.Handler that forwards requests to a pool of backends.
 type Balancer struct {
-	pool  *pool.Pool
-	strat strategy.Strategy
-	log   *slog.Logger
+	pool *pool.Pool
+	log  *slog.Logger
 
+	mu       sync.RWMutex
+	strat    strategy.Strategy
 	observer strategy.Observer
 
 	retryCfg RetryConfig
 	budget   *retry.Budget
 	passive  PassiveConfig
+	metrics  *metrics.Metrics
 }
 
 // Option configures a Balancer.
-//
-// GO NOTE: functional options. Week 1 called proxy.New(pool, strategy, log) and
-// that still compiles unchanged -- new capabilities are added without breaking
-// existing callers or tests. This is the standard Go answer to "my constructor
-// keeps growing".
 type Option func(*Balancer)
 
-// WithRetry enables retries, throttled by the shared budget.
+// WithRetry enables retries.
 func WithRetry(cfg RetryConfig, budget *retry.Budget) Option {
 	return func(b *Balancer) {
 		b.retryCfg = cfg
@@ -72,11 +64,15 @@ func WithPassiveHealth(cfg PassiveConfig) Option {
 	return func(b *Balancer) { b.passive = cfg }
 }
 
+// WithMetrics attaches Prometheus instrumentation.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(b *Balancer) { b.metrics = m }
+}
+
 // New builds a Balancer.
 func New(p *pool.Pool, s strategy.Strategy, log *slog.Logger, opts ...Option) *Balancer {
 	b := &Balancer{pool: p, strat: s, log: log}
 
-	// Resolved once, not per request.
 	if obs, ok := s.(strategy.Observer); ok {
 		b.observer = obs
 	}
@@ -87,14 +83,42 @@ func New(p *pool.Pool, s strategy.Strategy, log *slog.Logger, opts ...Option) *B
 	return b
 }
 
-// Strategy exposes the active strategy (admin endpoint).
-func (b *Balancer) Strategy() strategy.Strategy { return b.strat }
+// SwapStrategy atomically replaces the active strategy. Called by the config
+// reloader. Requests already in flight finish with the old strategy; the next
+// request uses the new one.
+func (b *Balancer) SwapStrategy(s strategy.Strategy) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.strat = s
+	if obs, ok := s.(strategy.Observer); ok {
+		b.observer = obs
+	} else {
+		b.observer = nil
+	}
+}
 
-// Pool exposes the backend pool (admin endpoint).
+// Strategy returns the current strategy.
+func (b *Balancer) Strategy() strategy.Strategy {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.strat
+}
+
+// Pool exposes the backend pool.
 func (b *Balancer) Pool() *pool.Pool { return b.pool }
 
-// Budget exposes the retry budget, or nil (admin endpoint).
+// Budget exposes the retry budget, or nil.
 func (b *Balancer) Budget() *retry.Budget { return b.budget }
+
+func (b *Balancer) getObserver() strategy.Observer {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.observer
+}
+
+type observerHolder struct {
+	obs strategy.Observer
+}
 
 func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	maxAttempts := 1
@@ -102,17 +126,12 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		maxAttempts = 1 + b.retryCfg.MaxRetries
 	}
 
-	// One recorder for the whole request. If an attempt writes anything, later
-	// attempts are forbidden -- and wroteHeader is how we know.
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	tried := make(map[string]bool, maxAttempts)
 	dispatched := false
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// RETRY BUDGET. Without this, one dead backend doubles the load on
-			// the survivors, and two dead backends triple it -- a retry storm
-			// that turns a partial fault into a full outage.
 			if b.budget == nil || !b.budget.Allow() {
 				b.log.Warn("retry suppressed by budget", "path", r.URL.Path)
 				break
@@ -126,14 +145,11 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tried[target.Name] = true
 		dispatched = true
 
-		failed, transportErr := b.attempt(rec, r, target)
+		failed, transportErr := b.attempt(rec, r, target, attempt)
 		if !failed {
 			return
 		}
 
-		// A 5xx response has already been written to the client, so the request
-		// is finished whether we like it or not. Only a transport failure --
-		// where nothing was written -- leaves retrying open.
 		if transportErr == nil || rec.wroteHeader {
 			return
 		}
@@ -151,26 +167,22 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// attempt forwards the request to one backend and reports what happened.
-//
-// It is a separate function purely so that DecInflight and Breaker.Release run
-// under defer. In a loop body a defer would pile up until the whole handler
-// returned, leaking in-flight counts and breaker probe slots.
-func (b *Balancer) attempt(rec *statusRecorder, r *http.Request, target *backend.Backend) (failed bool, transportErr error) {
+func (b *Balancer) attempt(rec *statusRecorder, r *http.Request, target *backend.Backend, attempt int) (failed bool, transportErr error) {
+	strat := b.Strategy()
+	obs := b.getObserver()
+
 	target.IncInflight()
 	defer target.DecInflight()
 
-	if b.observer != nil {
-		b.observer.OnStart(target)
+	if obs != nil {
+		obs.OnStart(target)
 	}
 
-	// A fresh retry slot per attempt, so a failure from attempt 1 cannot be
-	// mistaken for a failure of attempt 2.
 	ctx, state := retryctx.With(r.Context())
 	req := r.WithContext(ctx)
 
 	rec.Header().Set("X-Gobalance-Backend", target.Name)
-	rec.Header().Set("X-Gobalance-Strategy", b.strat.Name())
+	rec.Header().Set("X-Gobalance-Strategy", strat.Name())
 
 	start := time.Now()
 	target.Proxy.ServeHTTP(rec, req)
@@ -188,25 +200,42 @@ func (b *Balancer) attempt(rec *statusRecorder, r *http.Request, target *backend
 			b.budget.OnFailure()
 		}
 
-		// PASSIVE HEALTH CHECK. The active checker in internal/health polls on
-		// an interval; this reacts to real traffic in between polls. Active
-		// detects failure before a user is harmed and is the only thing that
-		// can detect recovery. Passive costs nothing and is instant. Neither is
-		// sufficient alone.
 		if b.passive.Enabled && n >= b.passive.ConsecutiveFailures && target.Healthy() {
 			target.SetHealthy(false)
 			b.log.Warn("backend ejected by passive health check",
 				"backend", target.Name, "consecutive_failures", n)
+		}
+
+		// Metrics: distinguish transport failures from upstream 5xx.
+		if b.metrics != nil {
+			if state.Err != nil {
+				b.metrics.FailuresTotal.WithLabelValues(target.Name, "transport").Inc()
+			} else {
+				b.metrics.FailuresTotal.WithLabelValues(target.Name, "5xx").Inc()
+			}
+			if attempt > 0 {
+				b.metrics.RetriesTotal.WithLabelValues(target.Name, "failed").Inc()
+			}
 		}
 	} else {
 		target.RecordSuccess()
 		if b.budget != nil {
 			b.budget.OnSuccess()
 		}
+		if b.metrics != nil && attempt > 0 {
+			b.metrics.RetriesTotal.WithLabelValues(target.Name, "succeeded").Inc()
+		}
 	}
 
-	if b.observer != nil {
-		b.observer.OnFinish(target, latency, state.Err)
+	if obs != nil {
+		obs.OnFinish(target, latency, state.Err)
+	}
+
+	// Prometheus request metrics.
+	if b.metrics != nil {
+		code := fmt.Sprintf("%d", rec.status)
+		b.metrics.RequestsTotal.WithLabelValues(target.Name, strat.Name(), r.Method, code).Inc()
+		b.metrics.RequestDuration.WithLabelValues(target.Name, strat.Name()).Observe(latency.Seconds())
 	}
 
 	b.log.Debug("proxied request",
@@ -216,11 +245,6 @@ func (b *Balancer) attempt(rec *statusRecorder, r *http.Request, target *backend
 	return failed, state.Err
 }
 
-// choose picks an eligible backend and reserves a breaker slot for it.
-//
-// Eligible means: healthy, not already tried for this request, and the breaker
-// is willing. The bounded loop handles the race where a breaker's state changes
-// between the Ready check and the Acquire.
 func (b *Balancer) choose(r *http.Request, tried map[string]bool) *backend.Backend {
 	const maxPickAttempts = 8
 
@@ -232,8 +256,6 @@ func (b *Balancer) choose(r *http.Request, tried map[string]bool) *backend.Backe
 			if tried[be.Name] {
 				continue
 			}
-			// Ready is deliberately side-effect free. Using Acquire here would
-			// burn a half-open probe slot on every backend merely by looking.
 			if be.Breaker != nil && !be.Breaker.Ready() {
 				continue
 			}
@@ -244,7 +266,8 @@ func (b *Balancer) choose(r *http.Request, tried map[string]bool) *backend.Backe
 			return nil
 		}
 
-		target, err := b.strat.Pick(r, candidates)
+		strat := b.Strategy()
+		target, err := strat.Pick(r, candidates)
 		if err != nil || target == nil {
 			return nil
 		}
@@ -253,26 +276,12 @@ func (b *Balancer) choose(r *http.Request, tried map[string]bool) *backend.Backe
 			return target
 		}
 
-		// Lost the probe slot to a concurrent request. Exclude and re-pick.
 		tried[target.Name] = true
 	}
 
 	return nil
 }
 
-// isRetryable decides whether a request may legally be sent twice.
-//
-// Two conditions, both non-negotiable:
-//
-//  1. THE METHOD MUST BE IDEMPOTENT. Retrying a POST could charge a card twice.
-//     GET, HEAD, OPTIONS and TRACE are safe by definition in RFC 9110.
-//
-//  2. THERE MUST BE NO REQUEST BODY. A body is a one-shot stream; once read it
-//     is gone, and replaying it would mean buffering every request in memory --
-//     an unbounded memory cost and a denial-of-service vector.
-//
-// PUT and DELETE are idempotent too, but they usually carry bodies, so they are
-// excluded here rather than complicating the code for a rare case.
 func isRetryable(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
@@ -282,8 +291,6 @@ func isRetryable(r *http.Request) bool {
 	return r.ContentLength <= 0
 }
 
-// statusRecorder wraps http.ResponseWriter so the status code can be read back,
-// and so the retry loop can tell whether anything has been written yet.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -300,13 +307,11 @@ func (s *statusRecorder) WriteHeader(code int) {
 
 func (s *statusRecorder) Write(p []byte) (int, error) {
 	if !s.wroteHeader {
-		s.wroteHeader = true // an implicit 200
+		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(p)
 }
 
-// Unwrap lets http.ResponseController reach the real ResponseWriter, which is
-// what keeps flushing, hijacking and streaming working through the wrapper.
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 var _ http.Handler = (*Balancer)(nil)
