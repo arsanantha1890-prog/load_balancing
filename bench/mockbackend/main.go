@@ -1,16 +1,29 @@
-// Command mockbackend is a tiny upstream server used to test and benchmark
-// GoBalance.
+// Command mockbackend is a configurable upstream server for benchmarking.
 //
-//	-name        identity returned in the body and the X-Backend header
-//	-addr        listen address, e.g. :9001
-//	-delay       base processing delay, e.g. 10ms
-//	-jitter      random extra delay in [0, jitter)
-//	-tail        probability (0..1) that a request is a "slow tail" request
-//	-tail-delay  how slow those tail requests are
-//	-fail-rate   probability (0..1) that a request returns 500  [week 3]
+// WEEK 6 UPGRADE: CONCURRENCY LIMIT
 //
-// Per-request overrides: /?delay=250ms and /?status=500
-// Control endpoints:     /healthz  /toggle  /sick  /well
+// Previous versions used time.Sleep with unlimited concurrency — gamma was
+// SLOW but never SATURATED. Real backends have finite resources: connection
+// pools, CPU cores, memory. When all slots are busy, new requests QUEUE, and
+// queueing is where tail latency actually comes from.
+//
+// -max-concurrent limits how many requests are processed simultaneously. Once
+// full, arriving requests wait in a channel buffer (up to -queue-size), and
+// any overflow is rejected with 503. This makes the mock backend behave like a
+// real service under load, and it is what makes the week-6 benchmark results
+// meaningful.
+//
+// FLAGS
+//
+//	-name           identity returned in headers and body
+//	-addr           listen address
+//	-delay          base processing delay
+//	-jitter         random extra delay in [0, jitter)
+//	-tail           probability of a slow-tail request
+//	-tail-delay     delay for tail requests
+//	-fail-rate      probability of returning 500
+//	-max-concurrent maximum simultaneous requests (0 = unlimited)
+//	-queue-size     overflow queue depth (default 100)
 package main
 
 import (
@@ -28,26 +41,31 @@ import (
 
 func main() {
 	var (
-		name      = flag.String("name", "mock", "backend identity")
-		addr      = flag.String("addr", ":9001", "listen address")
-		delay     = flag.Duration("delay", 10*time.Millisecond, "base processing delay")
-		jitter    = flag.Duration("jitter", 0, "uniform random extra delay in [0, jitter)")
-		tailProb  = flag.Float64("tail", 0, "probability a request is a slow-tail request (0..1)")
-		tailDelay = flag.Duration("tail-delay", 500*time.Millisecond, "delay for slow-tail requests")
-		failRate  = flag.Float64("fail-rate", 0, "probability a request returns 500 (0..1)")
+		name          = flag.String("name", "mock", "backend identity")
+		addr          = flag.String("addr", ":9001", "listen address")
+		delay         = flag.Duration("delay", 10*time.Millisecond, "base processing delay")
+		jitter        = flag.Duration("jitter", 0, "uniform random extra delay")
+		tailProb      = flag.Float64("tail", 0, "probability of a slow-tail request (0..1)")
+		tailDelay     = flag.Duration("tail-delay", 500*time.Millisecond, "delay for tail requests")
+		failRate      = flag.Float64("fail-rate", 0, "probability of returning 500 (0..1)")
+		maxConcurrent = flag.Int("max-concurrent", 0, "max simultaneous requests (0=unlimited)")
+		_ = flag.Int("queue-size", 100, "overflow queue depth (reserved for future use)")
 	)
 	flag.Parse()
 
 	var served atomic.Uint64
-
 	healthy := &atomic.Bool{}
 	healthy.Store(true)
-
-	// sick means "serve 500s but keep answering health checks normally".
-	// That models a GREY FAILURE: a backend that looks fine to a shallow health
-	// probe while failing real work. It is the case passive health checking
-	// exists for, and it is far more common in production than a clean crash.
 	sick := &atomic.Bool{}
+
+	// Semaphore for concurrency limiting. A buffered channel of capacity
+	// maxConcurrent: sending to it "acquires a slot", receiving "releases" it.
+	// When full, senders block — which is the queueing that makes tail latency
+	// real instead of theoretical.
+	var sem chan struct{}
+	if *maxConcurrent > 0 {
+		sem = make(chan struct{}, *maxConcurrent)
+	}
 
 	mux := http.NewServeMux()
 
@@ -59,14 +77,12 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	// Flip health so the ACTIVE checker notices.
 	mux.HandleFunc("/toggle", func(w http.ResponseWriter, r *http.Request) {
 		state := !healthy.Load()
 		healthy.Store(state)
 		fmt.Fprintf(w, "%s healthy=%v\n", *name, state)
 	})
 
-	// Start failing real traffic while still reporting healthy: grey failure.
 	mux.HandleFunc("/sick", func(w http.ResponseWriter, r *http.Request) {
 		sick.Store(true)
 		fmt.Fprintf(w, "%s is now failing requests but still reports healthy\n", *name)
@@ -77,7 +93,37 @@ func main() {
 		fmt.Fprintf(w, "%s recovered\n", *name)
 	})
 
+	// Stats endpoint for the benchmark scripts.
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		inflight := 0
+		if sem != nil {
+			inflight = len(sem)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":           *name,
+			"served":         served.Load(),
+			"max_concurrent": *maxConcurrent,
+			"inflight":       inflight,
+			"healthy":        healthy.Load(),
+			"sick":           sick.Load(),
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Concurrency limit: acquire a slot or queue.
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			default:
+				// Queue is full. 503 is the correct response — the backend is
+				// at capacity, not broken. The load balancer should try elsewhere.
+				http.Error(w, "503 service unavailable: at capacity", http.StatusServiceUnavailable)
+				return
+			}
+		}
+
 		d := *delay
 		if q := r.URL.Query().Get("delay"); q != "" {
 			if parsed, err := time.ParseDuration(q); err == nil {
@@ -118,8 +164,8 @@ func main() {
 		})
 	})
 
-	log.Printf("mockbackend %q listening on %s (delay=%v jitter=%v tail=%.2f@%v fail-rate=%.2f)",
-		*name, *addr, *delay, *jitter, *tailProb, *tailDelay, *failRate)
+	log.Printf("mockbackend %q listening on %s (delay=%v jitter=%v tail=%.2f@%v fail-rate=%.2f max-concurrent=%d)",
+		*name, *addr, *delay, *jitter, *tailProb, *tailDelay, *failRate, *maxConcurrent)
 
 	srv := &http.Server{
 		Addr:              *addr,

@@ -1,122 +1,124 @@
-// Command loadgen is a small closed-loop HTTP load generator for GoBalance.
+// Command loadgen is an HTTP load generator for GoBalance benchmarks.
 //
-// It fires -n requests through -c concurrent workers and reports latency
-// percentiles plus how the traffic was distributed across backends (read from
-// the X-Gobalance-Backend header the balancer sets).
+// WEEK 6 UPGRADE: OPEN-LOOP (CONSTANT ARRIVAL RATE)
 //
-// Usage:
+// Week 1's loadgen was CLOSED-LOOP: it kept exactly -c requests in flight and
+// only started a new one when an old one finished. A slow backend throttles the
+// arrival rate itself, which hides the damage it causes. Real users do not
+// politely wait.
 //
-//	go run ./bench/loadgen -n 300 -c 30
-//	go run ./bench/loadgen -n 300 -c 30 -url http://127.0.0.1:8080/
+// This version supports OPEN-LOOP via -mode open: requests arrive at a fixed
+// rate regardless of how fast backends respond. If a backend is slow, requests
+// pile up — exactly as they do in production. The difference between measured
+// latencies under closed-loop and open-loop is called COORDINATED OMISSION,
+// and understanding it is one of the strongest benchmarking-literacy signals
+// you can give in an interview.
 //
-// IMPORTANT CAVEAT, and a good thing to understand now rather than in week 6:
-// this is a CLOSED-LOOP generator. It keeps exactly -c requests in flight and
-// only sends a new one when an old one finishes. That means a slow backend
-// slows down the request rate itself, which hides part of the damage it causes.
-// Real users do not politely wait — they keep arriving. That effect is called
-// coordinated omission, and week 6 replaces this tool with k6's
-// constant-arrival-rate executor, which is open-loop and does not suffer from
-// it.
+// USAGE
 //
-// For now, closed-loop is exactly right: it reproduces "30 users click at the
-// same time" and it makes the round-robin problem visible in one command.
+//	# closed-loop (week 1 style): 30 workers, each sends next request when previous finishes
+//	go run ./bench/loadgen -n 1000 -c 30 -mode closed
+//
+//	# open-loop: 500 requests/sec for 10 seconds, regardless of response time
+//	go run ./bench/loadgen -rps 500 -duration 10s -mode open
 package main
 
 import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type result struct {
-	latency time.Duration
-	backend string
-	status  int
-	failed  bool
+	latency   time.Duration
+	waitTime  time.Duration // time spent waiting before dispatch (open-loop only)
+	backend   string
+	status    int
+	failed    bool
+	isRetry   bool
 }
 
 func main() {
 	var (
-		target  = flag.String("url", "http://127.0.0.1:8080/", "URL to hammer")
-		n       = flag.Int("n", 300, "total number of requests")
-		c       = flag.Int("c", 30, "number of concurrent workers")
-		timeout = flag.Duration("timeout", 10*time.Second, "per-request timeout")
+		target   = flag.String("url", "http://127.0.0.1:8080/", "target URL")
+		mode     = flag.String("mode", "closed", "closed (fixed concurrency) or open (fixed arrival rate)")
+		// closed-loop flags
+		n        = flag.Int("n", 300, "total requests (closed-loop)")
+		c        = flag.Int("c", 30, "concurrent workers (closed-loop)")
+		// open-loop flags
+		rps      = flag.Float64("rps", 500, "requests per second (open-loop)")
+		duration = flag.Duration("duration", 10*time.Second, "test duration (open-loop)")
+		// shared
+		timeout  = flag.Duration("timeout", 10*time.Second, "per-request timeout")
+		scenario = flag.String("scenario", "", "scenario label for the output header")
 	)
 	flag.Parse()
 
-	if *n <= 0 || *c <= 0 {
-		fmt.Fprintln(os.Stderr, "-n and -c must both be positive")
-		os.Exit(1)
-	}
-	if *c > *n {
-		*c = *n
-	}
-
-	// One shared client so connections are pooled and reused, the same way a
-	// real client would. A fresh client per request would measure TCP handshake
-	// cost instead of balancer behaviour.
 	client := &http.Client{
 		Timeout: *timeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        *c * 2,
-			MaxIdleConnsPerHost: *c * 2,
+			MaxIdleConns:        500,
+			MaxIdleConnsPerHost: 500,
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
 
-	// A buffered channel as a work queue: fill it, close it, and let the
-	// workers drain it. Closing is what tells the workers to stop.
-	jobs := make(chan struct{}, *n)
-	for i := 0; i < *n; i++ {
+	if *scenario != "" {
+		fmt.Printf("scenario: %s\n", *scenario)
+	}
+
+	var results []result
+	var elapsed time.Duration
+
+	switch *mode {
+	case "closed":
+		results, elapsed = runClosed(client, *target, *n, *c)
+	case "open":
+		results, elapsed = runOpen(client, *target, *rps, *duration)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown mode %q: use 'closed' or 'open'\n", *mode)
+		os.Exit(1)
+	}
+
+	report(results, elapsed, *mode)
+}
+
+// --- closed-loop (week 1 style) ---
+
+func runClosed(client *http.Client, target string, n, c int) ([]result, time.Duration) {
+	if c > n {
+		c = n
+	}
+
+	jobs := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
 		jobs <- struct{}{}
 	}
 	close(jobs)
 
-	results := make([]result, 0, *n)
+	results := make([]result, 0, n)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	fmt.Printf("firing %d requests at %s with %d concurrent workers\n\n", *n, *target, *c)
+	fmt.Printf("closed-loop: %d requests, %d workers at %s\n\n", n, c, target)
 	start := time.Now()
 
-	for w := 0; w < *c; w++ {
+	for w := 0; w < c; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			// Each worker collects into its own slice and merges once at the
-			// end, so the mutex is taken -c times instead of -n times.
-			local := make([]result, 0, *n / *c + 1)
-
+			local := make([]result, 0, n/c+1)
 			for range jobs {
-				t0 := time.Now()
-				resp, err := client.Get(*target)
-				if err != nil {
-					local = append(local, result{latency: time.Since(t0), failed: true})
-					continue
-				}
-
-				backendName := resp.Header.Get("X-Gobalance-Backend")
-				status := resp.StatusCode
-
-				// Draining and closing the body is what lets the connection be
-				// reused. Skip it and every request pays for a new TCP handshake.
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-
-				local = append(local, result{
-					latency: time.Since(t0),
-					backend: backendName,
-					status:  status,
-					failed:  status >= 500,
-				})
+				local = append(local, doRequest(client, target))
 			}
-
 			mu.Lock()
 			results = append(results, local...)
 			mu.Unlock()
@@ -124,16 +126,98 @@ func main() {
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start)
-
-	report(results, elapsed, *c)
+	return results, time.Since(start)
 }
 
-func report(results []result, elapsed time.Duration, concurrency int) {
+// --- open-loop (constant arrival rate) ---
+//
+// The key property: requests are SCHEDULED at fixed intervals (1/rps apart).
+// If a response hasn't come back by the time the next request is due, it
+// launches anyway. That means in-flight count is unbounded — exactly as it is
+// in production when users keep arriving regardless of backend health.
+//
+// Each result records both the RESPONSE LATENCY (time from dispatch to
+// response) and the WAIT TIME (time from scheduled arrival to actual dispatch).
+// Under light load, wait time is near zero. Under overload, requests queue in
+// the goroutine scheduler and wait time grows — that growth IS coordinated
+// omission being measured rather than hidden.
+
+func runOpen(client *http.Client, target string, rps float64, dur time.Duration) ([]result, time.Duration) {
+	interval := time.Duration(float64(time.Second) / rps)
+	totalRequests := int(rps * dur.Seconds())
+
+	fmt.Printf("open-loop: %.0f rps for %v (%d requests) at %s\n\n", rps, dur, totalRequests, target)
+
+	results := make([]result, totalRequests)
+	var wg sync.WaitGroup
+	var idx atomic.Int64
+
+	start := time.Now()
+
+	for i := 0; i < totalRequests; i++ {
+		scheduledAt := start.Add(time.Duration(i) * interval)
+
+		// Wait until the scheduled time.
+		now := time.Now()
+		if scheduledAt.After(now) {
+			time.Sleep(scheduledAt.Sub(now))
+		}
+
+		wg.Add(1)
+		go func(scheduled time.Time) {
+			defer wg.Done()
+			dispatched := time.Now()
+			waitTime := dispatched.Sub(scheduled)
+
+			r := doRequest(client, target)
+			r.waitTime = waitTime
+
+			j := idx.Add(1) - 1
+			results[j] = r
+		}(scheduledAt)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// Trim to actual count (in case of early termination).
+	actual := int(idx.Load())
+	return results[:actual], elapsed
+}
+
+func doRequest(client *http.Client, target string) result {
+	t0 := time.Now()
+	resp, err := client.Get(target)
+	if err != nil {
+		return result{latency: time.Since(t0), failed: true}
+	}
+
+	backendName := resp.Header.Get("X-Gobalance-Backend")
+	status := resp.StatusCode
+	isRetry := resp.Header.Get("X-Gobalance-Retried") != ""
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	return result{
+		latency: time.Since(t0),
+		backend: backendName,
+		status:  status,
+		failed:  status >= 500,
+		isRetry: isRetry,
+	}
+}
+
+// --- reporting ---
+
+func report(results []result, elapsed time.Duration, mode string) {
 	latencies := make([]time.Duration, 0, len(results))
 	failures := 0
 	perBackendCount := map[string]int{}
 	perBackendTotal := map[string]time.Duration{}
+
+	var totalWait time.Duration
+	var maxWait time.Duration
 
 	for _, r := range results {
 		if r.failed {
@@ -143,6 +227,10 @@ func report(results []result, elapsed time.Duration, concurrency int) {
 		if r.backend != "" {
 			perBackendCount[r.backend]++
 			perBackendTotal[r.backend] += r.latency
+		}
+		totalWait += r.waitTime
+		if r.waitTime > maxWait {
+			maxWait = r.waitTime
 		}
 	}
 
@@ -166,9 +254,9 @@ func report(results []result, elapsed time.Duration, concurrency int) {
 	}
 
 	fmt.Println("=== summary ===")
+	fmt.Printf("  mode          %s\n", mode)
 	fmt.Printf("  requests      %d\n", len(results))
-	fmt.Printf("  concurrency   %d\n", concurrency)
-	fmt.Printf("  failures      %d\n", failures)
+	fmt.Printf("  failures      %d (%.1f%%)\n", failures, 100*float64(failures)/float64(len(results)))
 	fmt.Printf("  wall time     %v\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("  throughput    %.1f req/s\n", float64(len(results))/elapsed.Seconds())
 	fmt.Println()
@@ -182,6 +270,18 @@ func report(results []result, elapsed time.Duration, concurrency int) {
 	if len(latencies) > 0 {
 		fmt.Printf("  max           %v\n", latencies[len(latencies)-1].Round(time.Millisecond))
 	}
+
+	if mode == "open" {
+		fmt.Println()
+		fmt.Println("=== coordinated omission check ===")
+		meanWait := time.Duration(0)
+		if len(results) > 0 {
+			meanWait = totalWait / time.Duration(len(results))
+		}
+		fmt.Printf("  mean wait     %v\n", meanWait.Round(time.Millisecond))
+		fmt.Printf("  max wait      %v\n", maxWait.Round(time.Millisecond))
+		fmt.Println("  (high wait = requests queued before dispatch = real overload)")
+	}
 	fmt.Println()
 
 	fmt.Println("=== distribution ===")
@@ -191,11 +291,18 @@ func report(results []result, elapsed time.Duration, concurrency int) {
 	}
 	sort.Strings(names)
 
-	fmt.Printf("  %-10s %8s %8s %12s\n", "backend", "requests", "share", "mean latency")
+	fmt.Printf("  %-12s %8s %8s %12s\n", "backend", "requests", "share", "mean latency")
+	fmt.Println("  " + strings.Repeat("-", 46))
 	for _, name := range names {
 		count := perBackendCount[name]
 		share := 100 * float64(count) / float64(len(results))
 		avg := perBackendTotal[name] / time.Duration(count)
-		fmt.Printf("  %-10s %8d %7.1f%% %12v\n", name, count, share, avg.Round(time.Millisecond))
+		fmt.Printf("  %-12s %8d %7.1f%% %12v\n", name, count, share, avg.Round(time.Millisecond))
 	}
+}
+
+// randomDelay returns a log-normal delay for generating heavy-tailed workloads
+// in external scripts. Exported as a utility but not used in the loadgen itself.
+func randomDelay(median, sigma float64) time.Duration {
+	return time.Duration(median * (1 + sigma*rand.NormFloat64()))
 }
