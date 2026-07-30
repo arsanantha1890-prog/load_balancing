@@ -1,4 +1,5 @@
 # GoBalance
+[![CI](https://github.com/arsanantha1890-prog/load_balancing/actions/workflows/ci.yml/badge.svg)](https://github.com/arsanantha1890-prog/load_balancing/actions)
 
 A Layer-7 HTTP load balancer written in Go, with pluggable routing strategies,
 resilience features, live Kubernetes service discovery, and a benchmark suite
@@ -40,6 +41,7 @@ go run ./bench/loadgen -n 300 -c 30
 | Least-connections | in-flight count | O(n) | 7.0% |
 | P2C | in-flight count | O(1) | 8.3% |
 | EWMA-latency | latency × inflight | O(1) | 1.3% |
+| Consistent hash  | request key + load | O(1) | key-affine           |
 
 Switch with one flag: `go run ./cmd/gobalance -strategy ewma`
 
@@ -143,4 +145,4 @@ including methodology, results analysis, and conclusions.
 - [x] Week 5 — Kubernetes EndpointSlice service discovery
 - [x] Week 6 — open-loop loadgen, concurrency-limited backends, full benchmark
 - [x] Week 7 — results analysis and project report
-- [ ] Week 8 — stretch feature
+- [x] Week 8 — consistent hashing with bounded loads
