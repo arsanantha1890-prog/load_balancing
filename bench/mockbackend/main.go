@@ -1,29 +1,4 @@
-// Command mockbackend is a configurable upstream server for benchmarking.
-//
-// WEEK 6 UPGRADE: CONCURRENCY LIMIT
-//
-// Previous versions used time.Sleep with unlimited concurrency — gamma was
-// SLOW but never SATURATED. Real backends have finite resources: connection
-// pools, CPU cores, memory. When all slots are busy, new requests QUEUE, and
-// queueing is where tail latency actually comes from.
-//
-// -max-concurrent limits how many requests are processed simultaneously. Once
-// full, arriving requests wait in a channel buffer (up to -queue-size), and
-// any overflow is rejected with 503. This makes the mock backend behave like a
-// real service under load, and it is what makes the week-6 benchmark results
-// meaningful.
-//
-// FLAGS
-//
-//	-name           identity returned in headers and body
-//	-addr           listen address
-//	-delay          base processing delay
-//	-jitter         random extra delay in [0, jitter)
-//	-tail           probability of a slow-tail request
-//	-tail-delay     delay for tail requests
-//	-fail-rate      probability of returning 500
-//	-max-concurrent maximum simultaneous requests (0 = unlimited)
-//	-queue-size     overflow queue depth (default 100)
+
 package main
 
 import (
@@ -58,10 +33,6 @@ func main() {
 	healthy.Store(true)
 	sick := &atomic.Bool{}
 
-	// Semaphore for concurrency limiting. A buffered channel of capacity
-	// maxConcurrent: sending to it "acquires a slot", receiving "releases" it.
-	// When full, senders block — which is the queueing that makes tail latency
-	// real instead of theoretical.
 	var sem chan struct{}
 	if *maxConcurrent > 0 {
 		sem = make(chan struct{}, *maxConcurrent)
@@ -111,14 +82,12 @@ func main() {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Concurrency limit: acquire a slot or queue.
+
 		if sem != nil {
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			default:
-				// Queue is full. 503 is the correct response — the backend is
-				// at capacity, not broken. The load balancer should try elsewhere.
 				http.Error(w, "503 service unavailable: at capacity", http.StatusServiceUnavailable)
 				return
 			}

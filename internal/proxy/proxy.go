@@ -1,9 +1,3 @@
-// Package proxy is the request path.
-//
-// WEEK 4 CHANGES:
-//   - Prometheus metrics on every request (counters, histograms, failure labels)
-//   - Atomic strategy swap for hot reload
-//   - Retry attempt counter for the retries_total metric
 package proxy
 
 import (
@@ -83,9 +77,6 @@ func New(p *pool.Pool, s strategy.Strategy, log *slog.Logger, opts ...Option) *B
 	return b
 }
 
-// SwapStrategy atomically replaces the active strategy. Called by the config
-// reloader. Requests already in flight finish with the old strategy; the next
-// request uses the new one.
 func (b *Balancer) SwapStrategy(s strategy.Strategy) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

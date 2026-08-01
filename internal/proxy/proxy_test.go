@@ -19,11 +19,6 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newFakeUpstream spins up a real HTTP server that identifies itself.
-//
-// GO NOTE: httptest.NewServer starts a genuine server on a random free port.
-// These are real network calls, not mocks — which is exactly what you want when
-// testing a proxy.
 func newFakeUpstream(t *testing.T, name string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

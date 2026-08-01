@@ -1,33 +1,3 @@
-// Package health actively probes backends so the balancer stops sending
-// traffic to servers that are down.
-//
-// ACTIVE VERSUS PASSIVE
-//
-// Passive health checking observes real traffic: if requests to a backend keep
-// failing, mark it down. It costs nothing extra and reacts instantly -- but it
-// can only learn from requests it has already lost, and it can never tell you a
-// dead backend has recovered, because no traffic is being sent there to observe.
-//
-// Active health checking polls a dedicated endpoint on a timer. It costs a
-// little traffic and reacts within one interval rather than instantly -- but it
-// detects failure before any user request is harmed, and it is the ONLY way to
-// discover recovery.
-//
-// Neither is sufficient alone. This package does the active half; the passive
-// half lives in the proxy, where the real traffic is.
-//
-// HYSTERESIS
-//
-// The two thresholds are deliberately different:
-//
-//	UnhealthyThreshold  consecutive failures before ejecting
-//	HealthyThreshold    consecutive successes before readmitting
-//
-// A single threshold makes a marginal backend flap in and out of the pool on
-// every poll, and every transition disturbs the load distribution. Requiring a
-// RUN of results in each direction damps that. It is the same idea as a
-// thermostat's dead band, and it is why your heating does not click on and off
-// once a second.
 package health
 
 import (

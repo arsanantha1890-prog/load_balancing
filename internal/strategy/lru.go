@@ -8,32 +8,6 @@ import (
 	"github.com/arsanantha1890-prog/load_balancing/internal/backend"
 )
 
-// LeastRecentlyUsed picks whichever backend has gone longest without COMPLETING
-// a request.
-//
-// This is the corrected version of the week-1 exercise, and the story behind it
-// is worth keeping.
-//
-// The first version recorded the timestamp at PICK time. Trace it: "least
-// recently dispatched to" is, by definition, "the one whose turn it is" -- so
-// the algorithm collapsed into round-robin exactly, not approximately. It was
-// not a coding mistake; it was the algorithm being logically equivalent to a
-// simpler one.
-//
-// Moving the timestamp to COMPLETION time changes everything. A backend that
-// takes 92ms keeps a stale timestamp for the whole time it is working, so it
-// stops looking attractive precisely while it is busy. That requires the
-// Observer interface -- which is exactly what Observer exists for.
-//
-// Two fixes from the week-1 version:
-//   - keyed on b.Name instead of the *Backend pointer. Week 4's config reload
-//     and week 5's endpoint watcher rebuild Backend values, so pointer keys
-//     would leak memory and silently lose all state on every reconcile.
-//   - updates on completion rather than dispatch.
-//
-// Honest assessment: this is still weaker than least_connections, because a
-// single timestamp cannot distinguish "idle" from "handling twenty requests".
-// It is here as a worked example of the Observer pattern, not as a contender.
 type LeastRecentlyUsed struct {
 	mu       sync.Mutex
 	lastUsed map[string]time.Time

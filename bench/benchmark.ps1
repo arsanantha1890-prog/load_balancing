@@ -1,13 +1,3 @@
-# Week 6 benchmark: runs every strategy against every scenario and produces a
-# comparison CSV.
-#
-# PREREQUISITES
-#   - nothing on :8080 :8081 :9001 :9002 :9003
-#   - the project builds: go build ./...
-#
-# USAGE
-#   powershell -ExecutionPolicy Bypass -File .\bench\benchmark.ps1
-#   powershell -ExecutionPolicy Bypass -File .\bench\benchmark.ps1 -Mode open -RPS 500 -Duration 10
 
 param(
     [string]$Mode = 'both',       # 'closed', 'open', or 'both'

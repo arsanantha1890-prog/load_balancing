@@ -1,16 +1,3 @@
-# Chaos test: kill a backend mid-load and watch the balancer route around it.
-#
-# This is the week 3 demo. Run it, watch the output, and you have a two-minute
-# story that any interviewer will understand immediately.
-#
-# PREREQUISITES
-#   three mock backends running on :9001 :9002 :9003
-#   the balancer running on :8080 with health checks and retries enabled
-#
-# USAGE
-#   .\bench\chaos.ps1
-#   .\bench\chaos.ps1 -Scenario grey
-
 param(
     [ValidateSet('kill', 'grey')]
     [string]$Scenario = 'kill',

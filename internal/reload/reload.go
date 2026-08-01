@@ -1,28 +1,3 @@
-// Package reload watches gobalance.yaml for changes and applies them without
-// dropping connections.
-//
-// HOT RELOAD IS NOT A RESTART
-//
-// A restart drops every in-flight request. In a system handling real traffic,
-// "edit the config and restart" means every deploy is a brief outage. Hot
-// reload means the operator edits the file, saves, and the balancer picks it up
-// within a second -- with zero dropped connections.
-//
-// WHAT CAN BE RELOADED
-//
-//   - Backend list: add, remove, change URL or weight. Removed backends finish
-//     in-flight requests before being dropped (draining).
-//   - Strategy: switching from round_robin to p2c takes effect on the next request.
-//
-// WHAT CANNOT BE RELOADED (and why)
-//
-//   - Listen addresses: the TCP listener is already bound; changing it requires
-//     closing and reopening the socket, which IS a restart.
-//   - TLS certificates: same reason -- the listener holds the cert.
-//
-// These limitations are stated explicitly because they are often asked in
-// interviews: "what can't you hot-reload and why?" The answer is "anything
-// that requires re-binding a socket".
 package reload
 
 import (
@@ -39,8 +14,6 @@ import (
 	"github.com/arsanantha1890-prog/load_balancing/internal/strategy"
 )
 
-// ReloadFunc is called whenever a valid new config is loaded.
-// The proxy calls this to swap its strategy atomically.
 type ReloadFunc func(newStrategy strategy.Strategy)
 
 // Config holds what the reloader needs.
@@ -68,9 +41,6 @@ func Watch(ctx context.Context, cfg Config) error {
 
 	cfg.Log.Info("config watcher started", "path", cfg.Path)
 
-	// Debounce: editors write multiple events per save (write, chmod, rename).
-	// Reloading on each one wastes work and can hit a half-written file. Wait
-	// for a quiet period before applying.
 	var debounce *time.Timer
 
 	for {
@@ -134,8 +104,6 @@ func apply(cfg Config) {
 		newBackends = append(newBackends, b)
 	}
 
-	// Swap the pool atomically. pool.Set copies the slice, so old backends can
-	// drain their in-flight requests while new ones start receiving.
 	oldBackends := cfg.Pool.All()
 	cfg.Pool.Set(newBackends)
 

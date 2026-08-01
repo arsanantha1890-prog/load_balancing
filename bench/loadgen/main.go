@@ -1,26 +1,4 @@
-// Command loadgen is an HTTP load generator for GoBalance benchmarks.
-//
-// WEEK 6 UPGRADE: OPEN-LOOP (CONSTANT ARRIVAL RATE)
-//
-// Week 1's loadgen was CLOSED-LOOP: it kept exactly -c requests in flight and
-// only started a new one when an old one finished. A slow backend throttles the
-// arrival rate itself, which hides the damage it causes. Real users do not
-// politely wait.
-//
-// This version supports OPEN-LOOP via -mode open: requests arrive at a fixed
-// rate regardless of how fast backends respond. If a backend is slow, requests
-// pile up — exactly as they do in production. The difference between measured
-// latencies under closed-loop and open-loop is called COORDINATED OMISSION,
-// and understanding it is one of the strongest benchmarking-literacy signals
-// you can give in an interview.
-//
-// USAGE
-//
-//	# closed-loop (week 1 style): 30 workers, each sends next request when previous finishes
-//	go run ./bench/loadgen -n 1000 -c 30 -mode closed
-//
-//	# open-loop: 500 requests/sec for 10 seconds, regardless of response time
-//	go run ./bench/loadgen -rps 500 -duration 10s -mode open
+
 package main
 
 import (
@@ -91,7 +69,6 @@ func main() {
 	report(results, elapsed, *mode)
 }
 
-// --- closed-loop (week 1 style) ---
 
 func runClosed(client *http.Client, target string, n, c int) ([]result, time.Duration) {
 	if c > n {
@@ -129,18 +106,6 @@ func runClosed(client *http.Client, target string, n, c int) ([]result, time.Dur
 	return results, time.Since(start)
 }
 
-// --- open-loop (constant arrival rate) ---
-//
-// The key property: requests are SCHEDULED at fixed intervals (1/rps apart).
-// If a response hasn't come back by the time the next request is due, it
-// launches anyway. That means in-flight count is unbounded — exactly as it is
-// in production when users keep arriving regardless of backend health.
-//
-// Each result records both the RESPONSE LATENCY (time from dispatch to
-// response) and the WAIT TIME (time from scheduled arrival to actual dispatch).
-// Under light load, wait time is near zero. Under overload, requests queue in
-// the goroutine scheduler and wait time grows — that growth IS coordinated
-// omission being measured rather than hidden.
 
 func runOpen(client *http.Client, target string, rps float64, dur time.Duration) ([]result, time.Duration) {
 	interval := time.Duration(float64(time.Second) / rps)
@@ -208,7 +173,7 @@ func doRequest(client *http.Client, target string) result {
 	}
 }
 
-// --- reporting ---
+// reporting
 
 func report(results []result, elapsed time.Duration, mode string) {
 	latencies := make([]time.Duration, 0, len(results))
@@ -301,8 +266,6 @@ func report(results []result, elapsed time.Duration, mode string) {
 	}
 }
 
-// randomDelay returns a log-normal delay for generating heavy-tailed workloads
-// in external scripts. Exported as a utility but not used in the loadgen itself.
 func randomDelay(median, sigma float64) time.Duration {
 	return time.Duration(median * (1 + sigma*rand.NormFloat64()))
 }

@@ -1,30 +1,3 @@
-// kubernetes.go watches EndpointSlice objects for a named Service and
-// reconciles the backend pool whenever pods come and go.
-//
-// INFORMERS, NOT RAW WATCHES
-//
-// The Kubernetes API supports a raw Watch verb, but using it directly means
-// handling connection drops, bookmark events, re-list on 410 Gone, and
-// resource-version tracking. client-go's SharedInformerFactory wraps all of
-// that into a cache that fires Add/Update/Delete callbacks. Every production
-// Kubernetes controller uses informers, not raw watches.
-//
-// RECONCILIATION, NOT EVENT PROCESSING
-//
-// The callbacks do not try to apply a diff. They call reconcile(), which reads
-// the ENTIRE current state from the informer cache and rebuilds the backend
-// list from scratch. This is deliberately simple and correct: a diff-based
-// approach is faster but has to handle every combination of add/update/delete
-// across multiple EndpointSlice objects, and getting it wrong means a stale
-// pool. Reconciliation is O(n) where n is the number of endpoints, and n is
-// small — a few hundred at most.
-//
-// ENDPOINTSLICE, NOT ENDPOINTS
-//
-// The older Endpoints resource packs every address into one object. At scale,
-// every pod change rewrites the entire thing — O(n) updates for O(1) events.
-// EndpointSlice shards addresses across multiple smaller objects.
-// Endpoints is deprecated since Kubernetes 1.33.
 package discovery
 
 import (
@@ -87,9 +60,7 @@ func NewKubernetesProvider(client kubernetes.Interface, p *pool.Pool, cfg Kubern
 
 // Run starts the informer and blocks until ctx is cancelled.
 func (k *KubernetesProvider) Run(ctx context.Context) error {
-	// A SharedInformerFactory builds informers that share the underlying
-	// connection and cache. The namespace filter limits what we watch so the
-	// balancer doesn't need cluster-wide permissions.
+	
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		k.client,
 		30*time.Second, // resync interval — full re-list as a consistency check
@@ -98,8 +69,6 @@ func (k *KubernetesProvider) Run(ctx context.Context) error {
 
 	informer := factory.Discovery().V1().EndpointSlices().Informer()
 
-	// The event handler fires on every change. All three callbacks do the same
-	// thing: reconcile from scratch. This is correct, simple, and cheap.
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { k.reconcile(informer) },
 		UpdateFunc: func(old, new interface{}) { k.reconcile(informer) },
@@ -157,9 +126,7 @@ func (k *KubernetesProvider) reconcile(informer cache.SharedIndexInformer) {
 		}
 
 		for _, endpoint := range eps.Endpoints {
-			// Only route to endpoints that Kubernetes says are ready.
-			// A pod in the middle of shutting down has Ready=false and must
-			// not receive new traffic.
+
 			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
 				continue
 			}

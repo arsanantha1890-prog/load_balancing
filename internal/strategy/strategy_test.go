@@ -26,9 +26,6 @@ func testBackends(t *testing.T, n int) []*backend.Backend {
 	return out
 }
 
-// A load balancing strategy is defined by its DISTRIBUTION, not by any single
-// choice. So that is what we assert: over 3000 requests across 3 backends,
-// round-robin must be exactly uniform. Not approximately — exactly.
 func TestRoundRobinIsExactlyUniform(t *testing.T) {
 	s, err := strategy.Get("round_robin")
 	if err != nil {

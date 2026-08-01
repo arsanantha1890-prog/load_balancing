@@ -1,15 +1,3 @@
-// Package backend models a single upstream server that GoBalance can send
-// traffic to.
-//
-// A Backend holds four kinds of things:
-//  1. static configuration (name, URL, weight) fixed after New(),
-//  2. live counters (in-flight, totals, failures) updated concurrently,
-//  3. health state, owned by the health checker and the passive checks, and
-//  4. a *httputil.ReverseProxy, the standard library's HTTP proxy.
-//
-// GO NOTE: every incoming HTTP request is served by its own goroutine, so
-// several goroutines touch the same Backend simultaneously. That is why the
-// counters are sync/atomic types instead of plain ints.
 package backend
 
 import (
@@ -25,18 +13,15 @@ import (
 	"github.com/arsanantha1890-prog/load_balancing/internal/retryctx"
 )
 
-// Backend is one upstream server.
 type Backend struct {
 	Name   string
 	URL    *url.URL
 	Weight int
 
-	// Proxy forwards a request to this backend. Safe for concurrent use.
+	// Proxy forwards a request to this backend. 
 	Proxy *httputil.ReverseProxy
 
-	// Breaker is this backend's circuit breaker. Set once at construction time
-	// in main, before any request is served, and read-only afterwards. May be
-	// nil, which means "no breaker" -- every call site checks.
+	// Breaker is this backend's circuit breaker. Set once at construction time in main, before any request is served, and read-only afterwards. 
 	Breaker *breaker.Breaker
 
 	inflight       atomic.Int64  // requests currently being served
@@ -92,20 +77,6 @@ func New(name, rawURL string, weight int, dialTimeout, responseTimeout time.Dura
 		},
 		Transport: transport,
 
-		// WEEK 3 CHANGE, and the mechanism that makes retries possible.
-		//
-		// ReverseProxy calls ErrorHandler only for TRANSPORT failures --
-		// connection refused, DNS failure, timeout before the response line.
-		// At that moment nothing has been written to the client yet, so a retry
-		// elsewhere is still legal.
-		//
-		// Writing a 502 here (as week 1 did) would foreclose that option
-		// permanently. Instead the error is recorded into the request context
-		// and NOTHING is written, leaving the balancer to decide whether to try
-		// another backend or give up.
-		//
-		// If no retry state is present -- a health check, a direct call, a test
-		// -- fall back to the old behaviour so the caller still gets an answer.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if st := retryctx.From(r.Context()); st != nil {
 				st.Err = err
@@ -118,9 +89,6 @@ func New(name, rawURL string, weight int, dialTimeout, responseTimeout time.Dura
 	return b, nil
 }
 
-// --- live counters -------------------------------------------------------
-
-// IncInflight records a dispatch and returns the new in-flight count.
 func (b *Backend) IncInflight() int64 {
 	b.total.Add(1)
 	return b.inflight.Add(1)
@@ -149,16 +117,13 @@ func (b *Backend) RecordFailure() uint32 {
 }
 
 // RecordSuccess clears the consecutive failure run.
-//
-// CONSECUTIVE, not cumulative. A backend that fails 4 times then succeeds is
-// flaky, not down; only an unbroken run indicates a real outage.
+
 func (b *Backend) RecordSuccess() { b.consecFailures.Store(0) }
 
 // Healthy reports whether this backend may receive traffic.
 func (b *Backend) Healthy() bool { return b.healthy.Load() }
 
-// SetHealthy marks the backend up or down. Called by the health checker and by
-// the proxy's passive checks.
+// SetHealthy marks the backend up or down. Called by the health checker and by the proxy's passive checks.
 func (b *Backend) SetHealthy(v bool) { b.healthy.Store(v) }
 
 // BreakerState is a printable breaker state for the admin endpoint.

@@ -1,13 +1,4 @@
 # Runs the same workload through every strategy and prints a comparison table.
-#
-# PREREQUISITES
-#   1. the three mock backends are running (alpha :9001, beta :9002, gamma :9003)
-#   2. the -strategy flag patch in cmd/gobalance/PATCH.md has been applied
-#   3. nothing else is listening on :8080 or :8081
-#
-# USAGE
-#   .\bench\compare.ps1
-#   .\bench\compare.ps1 -Requests 600 -Concurrency 50
 
 param(
     [int]$Requests = 300,
@@ -43,8 +34,7 @@ foreach ($s in $Strategies) {
     Start-Sleep -Milliseconds 800
 
     try {
-        # A short warm-up. EWMA in particular has no latency history on its very
-        # first requests, so measuring from a cold start would understate it.
+
         go run .\bench\loadgen -n 100 -c $Concurrency | Out-Null
 
         $output = go run .\bench\loadgen -n $Requests -c $Concurrency | Out-String
