@@ -1,40 +1,3 @@
-// Package breaker implements a per-backend circuit breaker.
-//
-// THE PROBLEM IT SOLVES
-//
-// When a backend dies, every request sent to it costs a full connect timeout --
-// two seconds in our config. At 30 concurrent requests that is 30 goroutines
-// and 30 sockets tied up for two seconds each, doing nothing but waiting to
-// fail. The load balancer becomes slower than having no load balancer at all.
-//
-// Worse, those doomed requests keep the dead backend's queue full of retries at
-// exactly the moment it might be trying to restart.
-//
-// A circuit breaker is a small state machine that says "we already know this is
-// broken -- stop asking". It fails instantly instead of failing slowly, and it
-// probes cautiously instead of stampeding.
-//
-// THE STATE MACHINE
-//
-//	CLOSED ──── FailureThreshold consecutive failures ────► OPEN
-//	   ▲                                                      │
-//	   │                                            OpenTimeout elapses
-//	   │                                                      │
-//	   └──── SuccessThreshold consecutive probes ──── HALF-OPEN
-//	                                                          │
-//	                              any probe fails ────────────┘
-//	                                    (back to OPEN)
-//
-// CLOSED    normal operation, traffic flows, failures are counted
-// OPEN      reject immediately without touching the network
-// HALF-OPEN allow a strictly limited number of probe requests through to see
-//           whether the backend has recovered
-//
-// HALF-OPEN is the part people get wrong. Going straight from OPEN back to
-// CLOSED sends full production traffic at a backend that just came up cold --
-// empty caches, no warm connection pool -- and knocks it straight back down.
-// Letting exactly MaxProbes requests through at a time is the difference
-// between a recovery and an oscillation.
 package breaker
 
 import (
@@ -69,9 +32,7 @@ type Config struct {
 	// FailureThreshold is how many consecutive failures trip the breaker open.
 	FailureThreshold int
 
-	// SuccessThreshold is how many consecutive successful probes are needed in
-	// HALF-OPEN before closing. Greater than 1 protects against one lucky
-	// request being mistaken for a recovery.
+	// SuccessThreshold is how many consecutive successful probes are needed in HALF-OPEN before closing. Greater than 1 protects against one lucky request being mistaken for a recovery.
 	SuccessThreshold int
 
 	// OpenTimeout is how long to stay OPEN before allowing probes.
@@ -128,8 +89,6 @@ func (b *Breaker) SetClock(f func() time.Time) {
 	b.now = f
 }
 
-// State reports the current state, applying any pending OPEN -> HALF-OPEN
-// transition first.
 func (b *Breaker) State() State {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -137,10 +96,6 @@ func (b *Breaker) State() State {
 	return b.state
 }
 
-// Ready reports whether this backend is worth considering, WITHOUT consuming a
-// probe slot. The balancer calls this while filtering candidates, so it must
-// stay side-effect free -- otherwise merely looking at a half-open backend
-// would burn its probe budget.
 func (b *Breaker) Ready() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -156,9 +111,6 @@ func (b *Breaker) Ready() bool {
 	}
 }
 
-// Acquire reserves permission to send one request. It DOES consume a probe slot
-// in HALF-OPEN. Every successful Acquire must be paired with exactly one
-// Release, which is why the proxy calls it inside a function with a defer.
 func (b *Breaker) Acquire() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -189,8 +141,7 @@ func (b *Breaker) Release(success bool) {
 			b.probesInFlight--
 		}
 		if !success {
-			// A probe failed. Straight back to OPEN and restart the timer --
-			// do not give a flapping backend a second chance in the same cycle.
+			
 			b.tripLocked()
 			return
 		}
@@ -203,9 +154,6 @@ func (b *Breaker) Release(success bool) {
 
 	case StateClosed:
 		if success {
-			// CONSECUTIVE, not cumulative. One success resets the count. A
-			// backend that fails 4 times then succeeds is flaky, not broken;
-			// only an unbroken run of failures indicates a real outage.
 			b.consecFailures = 0
 			return
 		}
@@ -220,8 +168,6 @@ func (b *Breaker) Release(success bool) {
 	}
 }
 
-// maybeHalfOpenLocked promotes OPEN to HALF-OPEN once the timeout has elapsed.
-// Callers must hold b.mu.
 func (b *Breaker) maybeHalfOpenLocked() {
 	if b.state == StateOpen && b.now().Sub(b.openedAt) >= b.cfg.OpenTimeout {
 		b.state = StateHalfOpen

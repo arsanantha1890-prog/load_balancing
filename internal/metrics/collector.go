@@ -1,15 +1,3 @@
-// collector.go periodically syncs backend state into Prometheus gauges.
-//
-// WHY A PERIODIC COLLECTOR
-//
-// Request-path metrics (counters, histograms) are updated inline because every
-// request passes through the proxy anyway. But health and breaker STATE are
-// changed by background goroutines (the health checker) or by transitions
-// inside the breaker that happen independently of the request path.
-//
-// Polling every second is cheap (one pass over the backend list), keeps the
-// request path free of gauge updates, and gives Grafana a smooth timeline
-// rather than a staircase that only moves when a request happens to trigger it.
 package metrics
 
 import (

@@ -48,10 +48,6 @@ func deadURL(t *testing.T) string {
 	return u
 }
 
-// --- retries --------------------------------------------------------------
-
-// The headline week-3 behaviour: a dead backend must not become a client error
-// when a healthy backend is available.
 func TestRetryFailsOverToAHealthyBackend(t *testing.T) {
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "served")
@@ -82,8 +78,6 @@ func TestRetryFailsOverToAHealthyBackend(t *testing.T) {
 	}
 }
 
-// A POST must never be retried: the request may not be idempotent, and replaying
-// it could duplicate a side effect such as a payment.
 func TestPostIsNeverRetried(t *testing.T) {
 	dead := mkBackend(t, "dead", deadURL(t))
 	alive := mkBackend(t, "alive", httptest.NewServer(
@@ -104,9 +98,6 @@ func TestPostIsNeverRetried(t *testing.T) {
 	}
 }
 
-// A 5xx from the upstream has already been written to the client. Retrying is
-// physically impossible at that point, and attempting it would corrupt the
-// response.
 func TestFiveHundredIsNotRetried(t *testing.T) {
 	var hits atomic.Int32
 
@@ -176,8 +167,6 @@ func TestAllBackendsDeadReturns502(t *testing.T) {
 	}
 }
 
-// --- passive health -------------------------------------------------------
-
 func TestPassiveHealthEjectsAfterConsecutiveFailures(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -202,8 +191,6 @@ func TestPassiveHealthEjectsAfterConsecutiveFailures(t *testing.T) {
 	}
 }
 
-// A success in the middle of a run of failures resets the counter -- the
-// backend is flaky, not down.
 func TestPassiveHealthResetsOnSuccess(t *testing.T) {
 	var failNext atomic.Bool
 	failNext.Store(true)
@@ -240,10 +227,6 @@ func TestPassiveHealthResetsOnSuccess(t *testing.T) {
 	}
 }
 
-// --- circuit breaker ------------------------------------------------------
-
-// Once the breaker is open the backend must stop receiving traffic entirely,
-// so a dead upstream stops costing a connect timeout per request.
 func TestOpenBreakerStopsTrafficToTheBackend(t *testing.T) {
 	var hits atomic.Int32
 
@@ -293,11 +276,6 @@ func TestOpenBreakerStopsTrafficToTheBackend(t *testing.T) {
 	}
 }
 
-// --- retry budget ---------------------------------------------------------
-
-// An exhausted budget must stop retries even when a healthy backend exists.
-// That is the point: protecting the survivors is more important than saving
-// any individual request.
 func TestExhaustedBudgetSuppressesRetries(t *testing.T) {
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok")
