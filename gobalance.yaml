@@ -8,7 +8,7 @@ listen: ":8080"        # client traffic
 admin_listen: ":8081"  # /healthz, /readyz, /backends
 
 # round_robin | weighted_round_robin | least_connections | p2c | ewma | lru | random
-strategy: p2c
+strategy: ewma
 
 timeouts:
   read: 15s
